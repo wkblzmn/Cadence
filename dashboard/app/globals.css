@@ -1,26 +1,71 @@
 @import "tailwindcss";
 
-:root {
-  --background: #ffffff;
-  --foreground: #171717;
-}
+/* ── palette ──────────────────────────────────────────────────────────────
+   Roles, not raw hex, so light/dark swap in one place. The series hue and
+   both surfaces were run through the data-viz validator: lightness band,
+   chroma floor and >= 3:1 contrast all pass in both modes.
 
-@theme inline {
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
+   Dark is declared twice on purpose — the media query covers the OS setting,
+   the [data-theme] scope covers an explicit toggle, and the :not() guard lets
+   a light stamp beat OS-dark.                                              */
+
+:root {
+  color-scheme: light;
+
+  --page:             #f9f9f7;
+  --surface-1:        #fcfcfb;
+  --text-primary:     #0b0b0b;
+  --text-secondary:   #52514e;
+  --text-muted:       #898781;
+  --gridline:         #e1e0d9;
+  --baseline:         #c3c2b7;
+  --hairline:         rgba(11, 11, 11, 0.10);
+
+  --series-1:         #2a78d6;
+  --series-1-wash:    rgba(42, 120, 214, 0.10);
+
+  /* Status steps are fixed across modes and never used for a data series. */
+  --status-good:      #0ca30c;
+  --status-warning:   #fab219;
+  --status-critical:  #d03b3b;
 }
 
 @media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
+  :root:where(:not([data-theme="light"])) {
+    color-scheme: dark;
+
+    --page:           #0d0d0d;
+    --surface-1:      #1a1a19;
+    --text-primary:   #ffffff;
+    --text-secondary: #c3c2b7;
+    --text-muted:     #898781;
+    --gridline:       #2c2c2a;
+    --baseline:       #383835;
+    --hairline:       rgba(255, 255, 255, 0.10);
+
+    --series-1:       #3987e5;
+    --series-1-wash:  rgba(57, 135, 229, 0.12);
   }
 }
 
+:root[data-theme="dark"] {
+  color-scheme: dark;
+
+  --page:             #0d0d0d;
+  --surface-1:        #1a1a19;
+  --text-primary:     #ffffff;
+  --text-secondary:   #c3c2b7;
+  --text-muted:       #898781;
+  --gridline:         #2c2c2a;
+  --baseline:         #383835;
+  --hairline:         rgba(255, 255, 255, 0.10);
+
+  --series-1:         #3987e5;
+  --series-1-wash:    rgba(57, 135, 229, 0.12);
+}
+
 body {
-  background: var(--background);
-  color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+  background: var(--page);
+  color: var(--text-primary);
+  font-family: var(--font-geist-sans), system-ui, -apple-system, "Segoe UI", sans-serif;
 }

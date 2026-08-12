@@ -28,13 +28,24 @@ export async function POST(req: Request) {
     const realFeel  = optNumber(b.real_feel_c,  "real_feel_c",  -50, 100);
 
     // ON CONFLICT makes a retried POST a no-op instead of a duplicate row.
-    await sql`
+    const inserted = await sql`
       insert into readings (device_id, ts, temp_c, humidity, pressure_hpa, lux, real_feel_c)
       values (${deviceId}, ${ts}, ${tempC}, ${humidity}, ${pressure}, ${lux}, ${realFeel})
       on conflict (device_id, ts) do nothing
+      returning id
     `;
 
-    return NextResponse.json({ ok: true }, { status: 201 });
+    // A swallowed duplicate and a real write both answered 201 with no way to
+    // tell them apart, so a hub repeating one timestamp looked perfectly
+    // healthy from both ends while the table stopped growing. Say which.
+    if (inserted.length === 0) {
+      console.warn(`[ingest] duplicate reading ignored: ${deviceId} @ ${ts}`);
+    }
+
+    return NextResponse.json(
+      { ok: true, inserted: inserted.length },
+      { status: 201 }
+    );
   } catch (e) {
     return badRequest(e);
   }

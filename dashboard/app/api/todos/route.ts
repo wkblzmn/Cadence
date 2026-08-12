@@ -33,14 +33,24 @@ export async function POST(req: Request) {
     const b = await req.json();
     const title = reqString(b.title, "title", 200);
 
-    // Append to the end unless a position is given.
+    if (b.position !== undefined && !Number.isInteger(b.position)) {
+      throw new BadRequest("position must be an integer");
+    }
+    const position: number | null = b.position === undefined ? null : b.position;
+
+    // Append to the end unless a position is given. The fallback has to be a
+    // subquery inside the statement, not an interpolated sql`` fragment: the
+    // neon driver binds every interpolated value as a parameter rather than
+    // composing it, so a fragment here would be sent as a bound object and
+    // rejected by the int column.
     const rows = await sql`
       insert into todos (title, position)
       values (
         ${title},
-        ${typeof b.position === "number"
-            ? b.position
-            : sql`(select coalesce(max(position), 0) + 1 from todos)`}
+        coalesce(
+          ${position}::int,
+          (select coalesce(max(position), 0) + 1 from todos)
+        )
       )
       returning id, title, position, done
     `;

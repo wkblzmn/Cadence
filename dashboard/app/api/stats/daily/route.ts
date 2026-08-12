@@ -43,13 +43,18 @@ export async function GET(req: Request) {
 
   const deviceId = p.get("device_id") ?? DEVICE_ID;
 
+  // day::text is load-bearing. The neon driver parses a bare `date` column
+  // into a JS Date using the server process's timezone, so 2026-08-12 arrives
+  // as 2026-08-11T18:00:00Z under Asia/Dhaka — one day off, and String() on it
+  // gives "Wed Aug 12 2026 ...", which matches no key below. Keeping the day
+  // as text means it never round-trips through a Date at all.
   const rows = await sql`
-    select day, focus_seconds, session_count
+    select day::text as day, focus_seconds, session_count
     from session_daily(${deviceId}, ${from}::date, ${to}::date, ${TZ})
   `;
 
   // Fill gaps so a chart shows an empty day as zero rather than skipping it.
-  const byDay = new Map(rows.map(r => [String(r.day).slice(0, 10), r]));
+  const byDay = new Map(rows.map(r => [r.day as string, r]));
   const days: Array<{ day: string; focus_seconds: number; session_count: number }> = [];
 
   for (let d = new Date(from + "T00:00:00Z"); ; d.setUTCDate(d.getUTCDate() + 1)) {

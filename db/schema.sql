@@ -137,6 +137,50 @@ from session_intervals;
 --
 -- Days are local (Asia/Dhaka), not UTC — a "day" is what the user experienced.
 -- Storage stays UTC; only the bucketing is local.
+--
+-- This is the ONLY place the split is implemented. Everything below derives
+-- from it. An earlier revision had session_daily() split at midnight while
+-- session_daily_totals bucketed on started_at alone, so the two disagreed by
+-- exactly one midnight crossing — two "daily total" sources that do not match
+-- is worse than either one being wrong on its own.
+
+create or replace function session_segments(p_tz text default 'Asia/Dhaka')
+returns table (
+  device_id  text,
+  source     text,
+  day        date,
+  seg_start  timestamptz,
+  seg_end    timestamptz
+)
+language sql
+stable
+as $$
+  with bounds as (
+    select
+      i.device_id,
+      i.source,
+      i.started_at,
+      i.ended_at,
+      generate_series(
+        date_trunc('day', i.started_at at time zone p_tz),
+        date_trunc('day', i.ended_at   at time zone p_tz),
+        interval '1 day'
+      ) as local_day_start
+    from session_intervals_clamped i
+  )
+  select
+    device_id,
+    source,
+    local_day_start::date as day,
+    greatest(started_at, (local_day_start                     at time zone p_tz)) as seg_start,
+    least   (ended_at,   (local_day_start + interval '1 day') at time zone p_tz)  as seg_end
+  from bounds
+  -- A session ending exactly at midnight generates a trailing zero-length
+  -- segment on the following day. Dropping it keeps that day off the chart
+  -- instead of showing it as a day with a session worth 0 seconds.
+  where least   (ended_at,   (local_day_start + interval '1 day') at time zone p_tz)
+      > greatest(started_at, (local_day_start                     at time zone p_tz));
+$$;
 
 create or replace function session_daily(
   p_device_id text,
@@ -152,57 +196,45 @@ returns table (
 language sql
 stable
 as $$
-  with bounds as (
-    select
-      i.started_at,
-      i.ended_at,
-      generate_series(
-        date_trunc('day', i.started_at at time zone p_tz),
-        date_trunc('day', i.ended_at   at time zone p_tz),
-        interval '1 day'
-      ) as local_day_start
-    from session_intervals_clamped i
-    where i.device_id = p_device_id
-  ),
-  sliced as (
-    select
-      local_day_start::date as day,
-      greatest(started_at, (local_day_start                  at time zone p_tz)) as seg_start,
-      least   (ended_at,   (local_day_start + interval '1 day') at time zone p_tz) as seg_end
-    from bounds
-  )
   select
-    day,
-    sum(extract(epoch from (seg_end - seg_start)))::bigint as focus_seconds,
-    count(*)::bigint                                       as session_count
-  from sliced
-  where seg_end > seg_start
-    and day between p_from and p_to
-  group by day
-  order by day;
+    s.day,
+    sum(extract(epoch from (s.seg_end - s.seg_start)))::bigint as focus_seconds,
+    count(*)::bigint                                           as session_count
+  from session_segments(p_tz) s
+  where s.device_id = p_device_id
+    and s.day between p_from and p_to
+  group by s.day
+  order by s.day;
 $$;
 
 
 -- ── 2d. Convenience views for the dashboard ──────────────────────────────
+--
+-- Both derive from session_segments(), so they agree with session_daily() by
+-- construction. They take the default timezone; session_daily() is the one to
+-- call when the timezone has to be a parameter.
 
 create or replace view session_daily_totals as
 select
   device_id,
-  (started_at at time zone 'Asia/Dhaka')::date as day,
-  sum(extract(epoch from (ended_at - started_at)))::bigint as focus_seconds,
-  count(*) as segments
-from session_intervals_clamped
+  day,
+  sum(extract(epoch from (seg_end - seg_start)))::bigint as focus_seconds,
+  count(*)                                              as segments
+from session_segments()
 group by device_id, day
 order by day desc;
 
 -- Longest unbroken stretch per day. §8 calls for sustained focus; this is the
 -- standalone-mode version, before the vision tier adds attention quality.
+-- A session crossing midnight contributes its per-day portion to each day
+-- rather than its full length to the day it started — consistent with every
+-- other number here, at the cost of under-reporting an all-nighter.
 create or replace view session_longest_stretch as
 select
   device_id,
-  (started_at at time zone 'Asia/Dhaka')::date as day,
-  max(extract(epoch from (ended_at - started_at)))::bigint as longest_seconds
-from session_intervals_clamped
+  day,
+  max(extract(epoch from (seg_end - seg_start)))::bigint as longest_seconds
+from session_segments()
 group by device_id, day;
 
 create or replace view readings_latest as
@@ -241,4 +273,4 @@ order by device_id, ts desc;
 --   ('cadence-hub-01', '2026-08-12 00:15:00+06', 'stop',   'button');
 --
 -- select * from session_daily('cadence-hub-01', '2026-08-01', '2026-08-31');
--- Expect: 2026-08-11 -> 3600 s (25 min + 30 min), 2026-08-12 -> 900 s.
+-- Expect: 2026-08-11 -> 3300 s (25 min + 30 min), 2026-08-12 -> 900 s.
