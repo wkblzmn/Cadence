@@ -5,9 +5,13 @@
 //
 //  In scope : display, pages, encoder nav, buttons, timer state machine,
 //             BH1750 auto-dim, BME280 environment, character face,
-//             Wi-Fi, NTP, and a durable event queue.
-//  Not yet  : backend POST/GET, ESP-NOW satellite, camera. The queue below
-//             is shaped so POST is a one-function change, not a rewrite.
+//             Wi-Fi, NTP, durable event queue, and backend ingest.
+//  Not yet  : GET /api/todos, ESP-NOW satellite, camera.
+//
+//  Threading: rendering and input run in loop() on core 1. All networking
+//  runs in netTask on core 0, because HTTPClient blocks and a 2 s TLS
+//  handshake in loop() would freeze the UI and drop encoder detents. The
+//  event queue is shared across both and guarded by a mutex.
 //
 //  Libraries (Library Manager):
 //    LovyanGFX               by lovyan03
@@ -24,6 +28,8 @@
 #include <BH1750.h>
 #include <soc/gpio_reg.h>
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
 #include <time.h>
 #include "secrets.h"
 
@@ -398,7 +404,14 @@ QueuedEvent evq[EVQ_SIZE];
 uint8_t  evqHead = 0, evqCount = 0;
 uint16_t evqDropped = 0;
 
+// Written by loop() on core 1, read and drained by netTask on core 0.
+SemaphoreHandle_t evqLock = nullptr;
+
+#define EVQ_TAKE()  xSemaphoreTake(evqLock, portMAX_DELAY)
+#define EVQ_GIVE()  xSemaphoreGive(evqLock)
+
 static void evqPush(const char *type) {
+  EVQ_TAKE();
   if (evqCount == EVQ_SIZE) {
     evqHead = (evqHead + 1) % EVQ_SIZE;   // drop oldest
     evqCount--;
@@ -408,28 +421,192 @@ static void evqPush(const char *type) {
   e.uptimeMs = millis();
   snprintf(e.type, sizeof(e.type), "%s", type);
   evqCount++;
+  EVQ_GIVE();
 }
 
-// Drains once time is valid. Today it prints the payload; at Phase 3 the
-// printf becomes an HTTP POST and nothing else here changes.
-static void evqDrain() {
-  if (!timeValid || evqCount == 0) return;
+// Snapshot destination. A file-scope buffer rather than a parameter: the
+// Arduino IDE injects auto-generated prototypes above all user declarations,
+// so a signature naming QueuedEvent fails to compile. Only netTask reads or
+// writes this, so single ownership makes it safe without a second lock.
+QueuedEvent evqSnap[EVQ_SIZE];
+uint8_t     evqSnapCount = 0;
 
-  while (evqCount > 0) {
-    QueuedEvent &e = evq[evqHead];
-    char ts[32];
-    isoUtc(bootEpoch + (time_t)(e.uptimeMs / 1000), ts, sizeof(ts));
-    Serial.printf("[EVENT] {\"device_id\":\"%s\",\"ts\":\"%s\","
-                  "\"type\":\"%s\",\"source\":\"button\"}\n",
-                  DEVICE_ID, ts, e.type);
-    evqHead = (evqHead + 1) % EVQ_SIZE;
-    evqCount--;
+// Copies out up to EVQ_SIZE events into evqSnap without removing them. The
+// network call then happens with the lock released — holding a mutex across a
+// 2 s TLS handshake would block the UI thread on its next button press.
+static uint8_t evqSnapshot() {
+  EVQ_TAKE();
+  evqSnapCount = evqCount;
+  for (uint8_t i = 0; i < evqSnapCount; i++)
+    evqSnap[i] = evq[(evqHead + i) % EVQ_SIZE];
+  EVQ_GIVE();
+  return evqSnapCount;
+}
+
+// Removes exactly the n events that were snapshotted. Anything pushed during
+// the POST stays queued, which is why this counts rather than clearing.
+static void evqCommit(uint8_t n) {
+  EVQ_TAKE();
+  if (n > evqCount) n = evqCount;
+  evqHead = (evqHead + n) % EVQ_SIZE;
+  evqCount -= n;
+  EVQ_GIVE();
+}
+
+static uint8_t evqDepth() {
+  EVQ_TAKE();
+  uint8_t n = evqCount;
+  EVQ_GIVE();
+  return n;
+}
+
+// ═══════════════════════════════════════════════════ HTTP ingest
+
+// Everything below runs on netTask (core 0) only. HTTPClient blocks, which is
+// exactly why it is not allowed anywhere near loop().
+
+uint32_t apiLastOk     = 0;      // millis of the last 2xx
+uint16_t apiFailCount  = 0;
+int      apiLastStatus = 0;
+
+static int httpPostJson(const char *path, const String &body) {
+  String url = String(API_BASE) + path;
+  HTTPClient http;
+  bool opened;
+
+  if (url.startsWith("https://")) {
+    // Certificate validation skipped — documented deviation. Pinning a CA
+    // bundle costs ~8 KB of flash and needs rotating when the CA changes.
+    static WiFiClientSecure tls;
+    tls.setInsecure();
+    tls.setTimeout(10);
+    opened = http.begin(tls, url);
+  } else {
+    static WiFiClient plain;
+    opened = http.begin(plain, url);
   }
+  if (!opened) return -1;
 
-  if (evqDropped) {
-    Serial.printf("[EVENT] warning: %u events dropped (queue overflow)\n",
-                  evqDropped);
-    evqDropped = 0;
+  http.setConnectTimeout(5000);
+  http.setTimeout(10000);
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("Authorization", "Bearer " API_TOKEN);
+
+  int status = http.POST(body);
+  String resp = status > 0 ? http.getString() : String();
+  http.end();
+
+  apiLastStatus = status;
+  if (status >= 200 && status < 300) {
+    apiLastOk    = millis();
+    apiFailCount = 0;
+  } else {
+    if (apiFailCount < 1000) apiFailCount++;
+    Serial.printf("[API] %s -> %d %s\n", path, status, resp.c_str());
+  }
+  return status;
+}
+
+// ── session events (spec §7) ─────────────────────────────────────────────
+
+static void postSessionEvents() {
+  if (!timeValid) return;                 // §7: never send garbage timestamps
+
+  uint8_t n = evqSnapshot();
+  if (n == 0) return;
+
+  // Batched: draining 32 events as 32 separate TLS handshakes would take a
+  // minute and give 32 chances to fail.
+  String body = String("{\"device_id\":\"") + DEVICE_ID + "\",\"events\":[";
+  for (uint8_t i = 0; i < n; i++) {
+    char ts[32];
+    isoUtc(bootEpoch + (time_t)(evqSnap[i].uptimeMs / 1000), ts, sizeof(ts));
+    if (i) body += ',';
+    body += "{\"ts\":\"";  body += ts;
+    body += "\",\"type\":\""; body += evqSnap[i].type;
+    body += "\",\"source\":\"button\"}";
+  }
+  body += "]}";
+
+  int status = httpPostJson("/api/ingest/session-events", body);
+
+  if (status >= 200 && status < 300) {
+    evqCommit(n);
+    Serial.printf("[API] %u event(s) accepted\n", n);
+    if (evqDropped) {
+      Serial.printf("[API] warning: %u events were dropped before sending "
+                    "(queue overflow)\n", evqDropped);
+      evqDropped = 0;
+    }
+  } else if (status >= 400 && status < 500) {
+    // The server rejected the payload itself. Retrying cannot fix that, and
+    // keeping it would wedge the queue forever behind one bad row.
+    evqCommit(n);
+    Serial.printf("[API] %u event(s) REJECTED (%d) and discarded\n", n, status);
+  }
+  // 5xx or transport failure: leave them queued and try again later.
+}
+
+// ── readings (spec §7) ───────────────────────────────────────────────────
+
+static void appendJsonFloat(String &s, const char *key, float v, bool ok) {
+  s += "\""; s += key; s += "\":";
+  if (!ok || isnan(v)) { s += "null"; return; }
+  char buf[16];
+  snprintf(buf, sizeof(buf), "%.2f", v);
+  s += buf;
+}
+
+static void postReading() {
+  if (!timeValid) return;
+
+  char ts[32];
+  isoUtc(time(nullptr), ts, sizeof(ts));
+
+  // Nulls where the BME280 is absent. §7 allows it and the dashboard shows a
+  // gap, which is the honest representation of a missing sensor.
+  String body = String("{\"device_id\":\"") + DEVICE_ID + "\",\"ts\":\"" + ts + "\",";
+  appendJsonFloat(body, "temp_c",       tempC,     bmeOk); body += ',';
+  appendJsonFloat(body, "humidity",     humidity,  bmeOk); body += ',';
+  appendJsonFloat(body, "pressure_hpa", pressHpa,  bmeOk); body += ',';
+  appendJsonFloat(body, "lux",          lux,       luxOk); body += ',';
+  appendJsonFloat(body, "real_feel_c",  realFeelC, bmeOk);
+  body += "}";
+
+  httpPostJson("/api/ingest/readings", body);
+}
+
+// ── the network task ─────────────────────────────────────────────────────
+
+#define READING_INTERVAL_MS 60000UL
+#define API_RETRY_MS         5000UL
+
+static void netTask(void *) {
+  uint32_t lastReading = 0;
+  uint32_t lastAttempt = 0;
+
+  netBegin();          // first attempt immediately; retries are handled below
+
+  for (;;) {
+    netService();
+    ntpService();
+
+    if (netState == NET_UP && timeValid) {
+      uint32_t now = millis();
+
+      // Backoff after failures so a dead backend doesn't hammer the radio.
+      uint32_t wait = API_RETRY_MS * (apiFailCount > 6 ? 6 : apiFailCount + 1);
+      if (now - lastAttempt >= wait) {
+        if (evqDepth() > 0) { lastAttempt = now; postSessionEvents(); }
+      }
+
+      if (now - lastReading >= READING_INTERVAL_MS) {
+        lastReading = now;
+        postReading();
+      }
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(250));
   }
 }
 
@@ -450,13 +627,13 @@ static uint32_t sessionElapsedMs() {
        : sessionAccumMs;
 }
 
-// Feeds POST /api/ingest/session-events (spec §7). Queues against uptime and
-// drains with a real UTC timestamp once NTP has landed — never blocks on the
-// network, never invents a timestamp.
+// Feeds POST /api/ingest/session-events (spec §7). Queues against uptime;
+// netTask on core 0 sends it with a real UTC timestamp once NTP has landed.
+// Never blocks, never invents a timestamp.
 static void emitSessionEvent(const char *type) {
   evqPush(type);
-  Serial.printf("[EVENT] queued type=%s uptime_ms=%lu (depth %u)\n",
-                type, (unsigned long)millis(), evqCount);
+  Serial.printf("[EVENT] queued type=%s uptime_ms=%lu\n",
+                type, (unsigned long)millis());
 }
 
 static void timerShortPress() {
@@ -586,10 +763,20 @@ static void pageClock() {
   }
   canvas.drawString(buf, SCREEN_W / 2, 190);
 
-  if (evqCount > 0) {
-    snprintf(buf, sizeof(buf), "%u event%s queued",
-             evqCount, evqCount == 1 ? "" : "s");
-    canvas.setTextColor(C_DIM, C_BG);
+  uint8_t depth = evqDepth();
+  if (depth > 0) {
+    snprintf(buf, sizeof(buf), "%u event%s queued", depth, depth == 1 ? "" : "s");
+    canvas.setTextColor(C_WARN, C_BG);
+    canvas.drawString(buf, SCREEN_W / 2, 208);
+  } else if (apiLastOk) {
+    uint32_t agoS = (millis() - apiLastOk) / 1000;
+    if (agoS < 120) snprintf(buf, sizeof(buf), "synced %lus ago", (unsigned long)agoS);
+    else            snprintf(buf, sizeof(buf), "synced %lum ago", (unsigned long)(agoS / 60));
+    canvas.setTextColor(C_GOOD, C_BG);
+    canvas.drawString(buf, SCREEN_W / 2, 208);
+  } else if (netState == NET_UP && timeValid) {
+    snprintf(buf, sizeof(buf), "backend unreachable (%d)", apiLastStatus);
+    canvas.setTextColor(C_WARN, C_BG);
     canvas.drawString(buf, SCREEN_W / 2, 208);
   }
 }
@@ -815,21 +1002,28 @@ void setup() {
   attachInterrupt(PIN_ENC_CLK, encISR, CHANGE);
   attachInterrupt(PIN_ENC_DT,  encISR, CHANGE);
 
-  netBegin();       // non-blocking; the UI renders while this settles
+  evqLock = xSemaphoreCreateMutex();
+  if (!evqLock) {
+    Serial.println("FATAL: could not create the event queue mutex.");
+    while (true) delay(1000);
+  }
+
+  // Core 0 alongside the Wi-Fi stack; loop() keeps core 1 for rendering.
+  // 8 KB stack — TLS needs roughly 6 KB of it during the handshake.
+  xTaskCreatePinnedToCore(netTask, "net", 8192, nullptr, 1, nullptr, 0);
 
   tft.setBrightness(180);
+  Serial.printf("Backend: %s\n", API_BASE);
   Serial.println("Turn the knob to change page. Button starts the timer.\n");
 }
 
 void loop() {
   static uint32_t lastFrame = 0;
 
+  // Networking lives in netTask on core 0. Nothing blocking belongs here.
   handleInput();
   readSensors();
   applyAutoDim();
-  netService();
-  ntpService();
-  evqDrain();
 
   if (millis() - lastFrame >= 66) {      // ~15 fps
     lastFrame = millis();

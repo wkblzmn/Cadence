@@ -76,8 +76,20 @@ export function optNumber(v: unknown, field: string, min: number, max: number): 
   return v;
 }
 
+// Validation failures are 400 — the request is wrong and retrying will not
+// help. Everything else is 500. This distinction is load-bearing: the hub
+// treats 4xx as "drop this event" and 5xx as "keep it queued and retry". A
+// database outage reported as 400 would make the device discard good data.
 export function badRequest(e: unknown): NextResponse {
-  const msg = e instanceof BadRequest ? e.message : "invalid request body";
-  if (!(e instanceof BadRequest)) console.error(e);
-  return NextResponse.json({ error: msg }, { status: 400 });
+  if (e instanceof BadRequest) {
+    return NextResponse.json({ error: e.message }, { status: 400 });
+  }
+  if (e instanceof SyntaxError) {                    // malformed JSON body
+    return NextResponse.json({ error: "body is not valid JSON" }, { status: 400 });
+  }
+  console.error("[ingest] unhandled error:", e);
+  return NextResponse.json(
+    { error: "server error", detail: e instanceof Error ? e.message : String(e) },
+    { status: 500 }
+  );
 }
