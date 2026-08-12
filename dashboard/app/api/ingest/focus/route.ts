@@ -13,6 +13,8 @@ const STATES = ["focused", "distracted", "absent"] as const;
 // Written now because it is part of the locked contract, but nothing calls it
 // until Phase 4. The phone posts these, not the hub.
 
+type FocusRow = { ts: string; state: string; confidence: number | null };
+
 export async function POST(req: Request) {
   const denied = checkAuth(req);
   if (denied) return denied;
@@ -25,7 +27,8 @@ export async function POST(req: Request) {
       throw new BadRequest("samples must be an array of 1-500 items");
     }
 
-    const rows = b.samples.map((s: Record<string, unknown>, i: number) => {
+    const rows: FocusRow[] = (b.samples as unknown[]).map((item, i) => {
+      const s = item as Record<string, unknown>;
       try {
         return {
           ts:         reqTimestamp(s.ts, "ts"),

@@ -15,6 +15,11 @@ const SOURCE = ["button", "vision"] as const;
 // drain its whole queue in one request after a dropped link. Same contract,
 // fewer round trips — and the queue exists precisely because links drop.
 
+// req.json() returns `any`, so anything derived from it inherits `any` and
+// trips noImplicitAny at build time. Naming the row shape fixes that and
+// documents what actually reaches the database.
+type EventRow = { ts: string; type: string; source: string };
+
 export async function POST(req: Request) {
   const denied = checkAuth(req);
   if (denied) return denied;
@@ -23,12 +28,13 @@ export async function POST(req: Request) {
     const b = await req.json();
     const deviceId = reqString(b.device_id, "device_id", 64);
 
-    const raw = Array.isArray(b.events) ? b.events : [b];
+    const raw: unknown[] = Array.isArray(b.events) ? b.events : [b];
     if (raw.length === 0 || raw.length > 64) {
       throw new BadRequest("events must contain between 1 and 64 items");
     }
 
-    const rows = raw.map((e: Record<string, unknown>, i: number) => {
+    const rows: EventRow[] = raw.map((item, i) => {
+      const e = item as Record<string, unknown>;
       try {
         return {
           ts:     reqTimestamp(e.ts, "ts"),
