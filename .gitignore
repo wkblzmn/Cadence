@@ -1,0 +1,36 @@
+# ── credentials — the only truly important lines in this file ────────────
+firmware/cadence_hub/secrets.h
+dashboard/.env.local
+dashboard/.env*.local
+.env
+.env.local
+
+# ── Next.js / node ───────────────────────────────────────────────────────
+node_modules/
+.next/
+out/
+build/
+dist/
+.vercel/
+*.tsbuildinfo
+next-env.d.ts
+npm-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# ── Arduino ──────────────────────────────────────────────────────────────
+firmware/**/build/
+*.hex
+*.elf
+*.bin
+*.map
+
+# ── editors / OS ─────────────────────────────────────────────────────────
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+.DS_Store
