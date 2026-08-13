@@ -5,8 +5,9 @@
 //
 //  In scope : display, pages, encoder nav, buttons, timer state machine,
 //             BH1750 auto-dim, BME280 environment, character face,
-//             Wi-Fi, NTP, durable event queue, and backend ingest.
-//  Not yet  : GET /api/todos, ESP-NOW satellite, camera.
+//             Wi-Fi, NTP, durable event queue, backend ingest, and the
+//             todo list pulled from the dashboard.
+//  Not yet  : ESP-NOW satellite, camera.
 //
 //  Threading: rendering and input run in loop() on core 1. All networking
 //  runs in netTask on core 0, because HTTPClient blocks and a 2 s TLS
@@ -460,10 +461,60 @@ static uint8_t evqDepth() {
   return n;
 }
 
+// ═══════════════════════════════════════════════════ todos
+
+// The list now comes from GET /api/todos (spec §7), which returns open items
+// only, position-ordered. Declared here rather than beside the pages because
+// refreshTodos() below needs the type, and this file is compiled top-down.
+//
+// Written by netTask on core 0, read by render() on core 1 — so it needs its
+// own mutex, exactly like the event queue. Reusing evqLock would couple a
+// 15fps render to the network drain for no reason.
+
+#define TODO_MAX        12
+#define TODO_TITLE_LEN  64
+
+struct Todo { char title[TODO_TITLE_LEN]; };
+
+Todo todos[TODO_MAX];
+int  todoCount = 0;
+int  todoSel = 0;
+bool todoScrollMode = false;
+bool todosFetched = false;      // false until one GET has actually succeeded
+
+SemaphoreHandle_t todoLock = nullptr;
+
+#define TODO_TAKE()  xSemaphoreTake(todoLock, portMAX_DELAY)
+#define TODO_GIVE()  xSemaphoreGive(todoLock)
+
+
 // ═══════════════════════════════════════════════════ HTTP ingest
 
 // Everything below runs on netTask (core 0) only. HTTPClient blocks, which is
 // exactly why it is not allowed anywhere near loop().
+//
+// One client of each kind, shared by every request. A second WiFiClientSecure
+// would mean a second mbedTLS context, and the handshake is already the
+// largest thing this task allocates.
+static WiFiClientSecure tlsClient;
+static WiFiClient       plainClient;
+
+// Certificate validation skipped — documented deviation. Pinning a CA bundle
+// costs ~8 KB of flash and needs rotating when the CA changes.
+static bool httpBegin(HTTPClient &http, const String &url) {
+  bool opened;
+  if (url.startsWith("https://")) {
+    tlsClient.setInsecure();
+    tlsClient.setTimeout(10);
+    opened = http.begin(tlsClient, url);
+  } else {
+    opened = http.begin(plainClient, url);
+  }
+  if (!opened) return false;
+  http.setConnectTimeout(5000);
+  http.setTimeout(10000);
+  return true;
+}
 
 uint32_t apiLastOk     = 0;      // millis of the last 2xx
 uint16_t apiFailCount  = 0;
@@ -472,23 +523,9 @@ int      apiLastStatus = 0;
 static int httpPostJson(const char *path, const String &body) {
   String url = String(API_BASE) + path;
   HTTPClient http;
-  bool opened;
 
-  if (url.startsWith("https://")) {
-    // Certificate validation skipped — documented deviation. Pinning a CA
-    // bundle costs ~8 KB of flash and needs rotating when the CA changes.
-    static WiFiClientSecure tls;
-    tls.setInsecure();
-    tls.setTimeout(10);
-    opened = http.begin(tls, url);
-  } else {
-    static WiFiClient plain;
-    opened = http.begin(plain, url);
-  }
-  if (!opened) return -1;
+  if (!httpBegin(http, url)) return -1;
 
-  http.setConnectTimeout(5000);
-  http.setTimeout(10000);
   http.addHeader("Content-Type", "application/json");
   http.addHeader("Authorization", "Bearer " API_TOKEN);
 
@@ -576,14 +613,160 @@ static void postReading() {
   httpPostJson("/api/ingest/readings", body);
 }
 
+// ── todo list (spec §7) ──────────────────────────────────────────────────
+
+// No Authorization header: GET /api/todos is unauthenticated by design. The
+// route says why — the hub fetches it on a timer, the list is not sensitive,
+// and baking the token into a GET buys nothing.
+static int httpGetBody(const char *path, String &out) {
+  String url = String(API_BASE) + path;
+  HTTPClient http;
+
+  if (!httpBegin(http, url)) return -1;
+
+  int status = http.GET();
+  if (status > 0) out = http.getString();
+  http.end();
+  return status;
+}
+
+// Titles arrive as raw UTF-8 and the panel fonts are 8-bit, so anything above
+// ASCII has to be folded down or it draws as mojibake. This is the common case
+// rather than an edge case: an em-dash or a curly apostrophe typed into the
+// dashboard is two or three bytes by the time it reaches here.
+static char foldCodepoint(unsigned v) {
+  switch (v) {
+    case 0x2013: case 0x2014: return '-';    // en / em dash
+    case 0x2018: case 0x2019: return '\'';   // curly single quotes
+    case 0x201C: case 0x201D: return '"';    // curly double quotes
+    case 0x2026: return '.';                 // ellipsis
+    case 0x00A0: return ' ';                 // non-breaking space
+  }
+  return (v >= 32 && v < 127) ? (char)v : '?';
+}
+
+// Reads a JSON string value. `p` points just past the opening quote; returns
+// the position after the closing quote, or nullptr if it never terminates.
+//
+// Escapes are decoded rather than ignored. Titles are free text typed into the
+// dashboard, so a title containing a quote would otherwise end the string early
+// and shift every following field — the kind of bug that only appears once
+// somebody types an apostrophe-heavy task months from now.
+static const char *jsonReadString(const char *p, char *out, size_t n) {
+  size_t o = 0;
+  while (*p) {
+    char c = *p++;
+
+    if (c == '"') {                       // closing quote — done
+      out[o < n ? o : n - 1] = '\0';
+      return p;
+    }
+
+    if (c == '\\') {
+      char e = *p++;
+      if (!e) break;
+      switch (e) {
+        case 'n': c = '\n'; break;
+        case 't': c = ' ';  break;
+        case 'r': case 'b': case 'f': continue;   // nothing sane to draw
+        case 'u': {
+          // \uXXXX. The panel fonts are 8-bit, so anything above ASCII could
+          // not render anyway; substitute rather than emit a broken glyph.
+          unsigned v = 0; int k = 0;
+          for (; k < 4 && p[k]; k++) {
+            char h = p[k];
+            v <<= 4;
+            if      (h >= '0' && h <= '9') v |= (unsigned)(h - '0');
+            else if (h >= 'a' && h <= 'f') v |= (unsigned)(h - 'a' + 10);
+            else if (h >= 'A' && h <= 'F') v |= (unsigned)(h - 'A' + 10);
+            else break;
+          }
+          if (k == 4) { p += 4; c = foldCodepoint(v); }
+          else        { c = '?'; }
+          break;
+        }
+        default: c = e; break;            // \" \\ \/ and anything else literal
+      }
+
+    } else if ((unsigned char)c >= 0x80) {
+      // Raw UTF-8. Next.js sends these as bytes rather than \u escapes, so
+      // this is the path an em-dash actually takes. Decode the sequence to a
+      // codepoint and fold it, otherwise the continuation bytes each draw as
+      // a separate garbage glyph.
+      unsigned char uc = (unsigned char)c;
+      unsigned v = 0;
+      int extra = 0;
+      if      ((uc & 0xE0) == 0xC0) { v = uc & 0x1Fu; extra = 1; }
+      else if ((uc & 0xF0) == 0xE0) { v = uc & 0x0Fu; extra = 2; }
+      else if ((uc & 0xF8) == 0xF0) { v = uc & 0x07u; extra = 3; }
+      else continue;                      // stray continuation byte — drop it
+
+      for (int k = 0; k < extra; k++) {
+        if (((unsigned char)*p & 0xC0) != 0x80) break;   // truncated sequence
+        v = (v << 6) | ((unsigned char)*p++ & 0x3Fu);
+      }
+      c = foldCodepoint(v);
+    }
+
+    if (o + 1 < n) out[o++] = c;
+  }
+  return nullptr;                          // unterminated string
+}
+
+// Staging lives at file scope on purpose. netTask has an 8 KB stack and the
+// TLS handshake takes roughly 6 KB of it; a ~780 byte local here would be held
+// across that handshake. Only netTask touches this, so single ownership makes
+// it safe without a second lock — the same reasoning as evqSnap.
+static Todo todoStaging[TODO_MAX];
+
+static void refreshTodos() {
+  String body;
+  int status = httpGetBody("/api/todos", body);
+
+  // Any failure leaves the previous list on screen. A transient 5xx should not
+  // blank the panel — a stale list is more useful than an empty one.
+  if (status != 200) {
+    Serial.printf("[TODO] GET -> %d\n", status);
+    return;
+  }
+
+  // Only the titles are needed, and they arrive already ordered by position,
+  // so this walks the payload for title values instead of parsing JSON in
+  // general. Same reasoning as the hand-rolled validators on the server: one
+  // less dependency, and every rule it enforces is visible right here.
+  int n = 0;
+  const char *p = body.c_str();
+  while (n < TODO_MAX) {
+    const char *k = strstr(p, "\"title\":\"");
+    if (!k) break;
+    const char *after = jsonReadString(k + 9, todoStaging[n].title, TODO_TITLE_LEN);
+    if (!after) break;
+    p = after;
+    n++;
+  }
+
+  TODO_TAKE();
+  for (int i = 0; i < n; i++) todos[i] = todoStaging[i];
+  todoCount = n;
+  // The list can shrink under the selection while the user is scrolling it.
+  if (todoSel >= todoCount) todoSel = todoCount > 0 ? todoCount - 1 : 0;
+  todosFetched = true;
+  TODO_GIVE();
+
+  Serial.printf("[TODO] %d task%s from the dashboard\n", n, n == 1 ? "" : "s");
+}
+
 // ── the network task ─────────────────────────────────────────────────────
 
 #define READING_INTERVAL_MS 60000UL
 #define API_RETRY_MS         5000UL
+#define TODO_INTERVAL_MS    60000UL
+#define TODO_FIRST_TRY_MS    5000UL
 
 static void netTask(void *) {
   uint32_t lastReading = 0;
   uint32_t lastAttempt = 0;
+  uint32_t lastTodo    = 0;
 
   netBegin();          // first attempt immediately; retries are handled below
 
@@ -603,6 +786,14 @@ static void netTask(void *) {
       if (now - lastReading >= READING_INTERVAL_MS) {
         lastReading = now;
         postReading();
+      }
+
+      // Retry quickly until the first list lands, then settle to once a
+      // minute — a task added on the dashboard should appear without waiting
+      // out a full interval on boot.
+      if (now - lastTodo >= (todosFetched ? TODO_INTERVAL_MS : TODO_FIRST_TRY_MS)) {
+        lastTodo = now;
+        refreshTodos();
       }
     }
 
@@ -664,22 +855,6 @@ static void timerLongPress() {
   emitSessionEvent("stop");
   sessionAccumMs = 0;
 }
-
-// ═══════════════════════════════════════════════════ todos (stub)
-
-// Replaced by GET /api/todos once the backend exists (spec §7).
-struct Todo { const char *title; bool done; };
-Todo todos[] = {
-  { "Replace the BME280",        false },
-  { "Solder 100nF on CLK / DT",  false },
-  { "Wi-Fi + NTP on the hub",    false },
-  { "POST readings to backend",  false },
-  { "Todo sync from dashboard",  false },
-  { "Camera board bring-up",     false },
-};
-const int todoCount = sizeof(todos) / sizeof(todos[0]);
-int  todoSel = 0;
-bool todoScrollMode = false;
 
 // ═══════════════════════════════════════════════════ pages
 
@@ -780,23 +955,45 @@ static void pageHome() {
   char buf[40];
 
   // ── top strip ──────────────────────────────────────────────────────────
-  // 24-hour is mandatory, not a preference. Font7 HH:MM is ~126px and an
-  // AM/PM suffix adds ~24px; with the timer beside it the row overflows 320.
-  // Seconds are dropped for the same reason — HH:MM:SS runs to ~200px, which
-  // leaves nothing for the timer. Seconds still tick on the Status page.
-  canvas.setFont(&fonts::Font7);
-  canvas.setTextDatum(middle_left);
+  // 12-hour with an AM/PM suffix. The earlier note called 24-hour mandatory
+  // rather than a preference, but that was measured against a layout carrying
+  // a weather box and a Font7 timer: 126 clock + 24 suffix + 126 timer +
+  // weather came to 324px on a 320px panel. The weather box is cut and the
+  // timer dropped to Font4, so the row now measures ~10 + 126 + 6 + 18 on the
+  // left against a timer starting near 198 — it fits with room to spare.
+  //
+  // Seconds are still dropped: HH:MM:SS in Font7 runs ~200px and would leave
+  // nothing for the timer. They tick on the Status page instead.
+  //
+  // Font7 is a seven-segment face with no letters in it, so the suffix is
+  // drawn separately in Font2 and placed from the measured clock width rather
+  // than a hardcoded offset — the hour is one or two digits wide.
+  bool isPM = false;
   if (timeValid) {
     time_t now = time(nullptr);
     struct tm lt;
     localtime_r(&now, &lt);
-    snprintf(buf, sizeof(buf), "%02d:%02d", lt.tm_hour, lt.tm_min);
+    int h12 = lt.tm_hour % 12;
+    if (h12 == 0) h12 = 12;              // midnight and noon are 12, not 0
+    isPM = lt.tm_hour >= 12;
+    snprintf(buf, sizeof(buf), "%2d:%02d", h12, lt.tm_min);
     canvas.setTextColor(C_TEXT, C_BG);
   } else {
     snprintf(buf, sizeof(buf), "--:--");
     canvas.setTextColor(C_DIM, C_BG);
   }
+
+  canvas.setFont(&fonts::Font7);
+  canvas.setTextDatum(middle_left);
   canvas.drawString(buf, 10, 28);
+  int clockW = canvas.textWidth(buf);
+
+  if (timeValid) {
+    canvas.setFont(&fonts::Font2);
+    canvas.setTextDatum(middle_left);
+    canvas.setTextColor(C_DIM, C_BG);
+    canvas.drawString(isPM ? "PM" : "AM", 10 + clockW + 6, 36);
+  }
 
   canvas.setFont(&fonts::Font2);
   canvas.setTextDatum(middle_right);
@@ -853,13 +1050,18 @@ static void pageHome() {
   }
 
   // ── bottom bar ─────────────────────────────────────────────────────────
-  int remaining = 0;
-  for (int i = 0; i < todoCount; i++) if (!todos[i].done) remaining++;
+  // Everything the endpoint returns is open, so the count is the list length.
+  TODO_TAKE();
+  int remaining = todoCount;
+  bool fetched  = todosFetched;
+  TODO_GIVE();
 
   canvas.setFont(&fonts::Font2);
   canvas.setTextDatum(middle_left);
   canvas.setTextColor(remaining ? C_TEXT : C_DIM, C_BG);
-  snprintf(buf, sizeof(buf), "%d task%s left", remaining, remaining == 1 ? "" : "s");
+  if (!fetched) snprintf(buf, sizeof(buf), "tasks ...");
+  else          snprintf(buf, sizeof(buf), "%d task%s left",
+                         remaining, remaining == 1 ? "" : "s");
   canvas.drawString(buf, 12, 200);
 
   // Vision is Phase 4. Until the phone posts focus samples the honest state is
@@ -873,9 +1075,29 @@ static void pageHome() {
   canvas.drawString("STANDALONE", pillX + pillW / 2, 200);
 }
 
-// Page 02 — Tasks. Unchanged by the redesign.
+// Page 02 — Tasks. Layout unchanged by the redesign; the contents now come
+// from the dashboard rather than a hardcoded array.
+//
+// Drawn with todoLock held. The critical section is a handful of sprite writes
+// and netTask only contends with it once a minute, so the simple thing is also
+// the correct thing here — copying rows out first would buy nothing.
 static void pageTasks() {
   const int rowH = 30, top = 34, visible = 5;
+
+  TODO_TAKE();
+
+  if (todoCount == 0) {
+    bool fetched = todosFetched;
+    TODO_GIVE();
+    canvas.setFont(&fonts::Font2);
+    canvas.setTextDatum(middle_center);
+    canvas.setTextColor(fetched ? C_DIM : C_WARN, C_BG);
+    canvas.drawString(fetched ? "Nothing open"
+                              : "Waiting for the dashboard...",
+                      SCREEN_W / 2, SCREEN_H / 2);
+    return;
+  }
+
   int first = todoSel - visible / 2;
   if (first < 0) first = 0;
   if (first > todoCount - visible) first = todoCount - visible;
@@ -890,13 +1112,32 @@ static void pageTasks() {
     if (sel) canvas.fillRoundRect(8, y, SCREEN_W - 16, rowH - 4, 4,
                                   todoScrollMode ? C_ACCENT : C_PANEL);
 
+    uint16_t bg = sel ? (todoScrollMode ? C_ACCENT : C_PANEL) : C_BG;
     canvas.setTextDatum(middle_left);
-    canvas.setTextColor(sel && todoScrollMode ? C_BG
-                      : todos[idx].done ? C_DIM : C_TEXT,
-                        sel ? (todoScrollMode ? C_ACCENT : C_PANEL) : C_BG);
-    canvas.drawString(todos[idx].done ? "[x]" : "[ ]", 18, y + rowH / 2 - 2);
-    canvas.drawString(todos[idx].title, 48, y + rowH / 2 - 2);
+    canvas.setTextColor(sel && todoScrollMode ? C_BG : C_DIM, bg);
+    canvas.drawString("-", 18, y + rowH / 2 - 2);
+
+    // No checkbox. Every item here is open by definition — the endpoint
+    // filters done items out — and a checkbox on a device that cannot toggle
+    // one would promise an interaction that does not exist.
+    //
+    // Titles are free text from the dashboard, so they have to be clipped:
+    // drawString does not bound itself and a long one would run off the panel.
+    // 264px at ~8px per Font2 char is about 33 characters.
+    char shown[36];
+    const char *t = todos[idx].title;
+    if (strlen(t) > 33) {
+      memcpy(shown, t, 31);
+      shown[31] = '.'; shown[32] = '.'; shown[33] = '\0';
+    } else {
+      snprintf(shown, sizeof(shown), "%s", t);
+    }
+
+    canvas.setTextColor(sel && todoScrollMode ? C_BG : C_TEXT, bg);
+    canvas.drawString(shown, 40, y + rowH / 2 - 2);
   }
+
+  TODO_GIVE();
 
   canvas.setTextDatum(middle_center);
   canvas.setTextColor(C_DIM, C_BG);
@@ -1011,7 +1252,11 @@ static void handleInput() {
   if (delta != 0) {
     lastEnc = pos;
     if (todoScrollMode) {
-      todoSel = constrain(todoSel + (int)delta, 0, todoCount - 1);
+      // constrain(x, 0, -1) on an empty list would pin the selection to -1 and
+      // index out of bounds on the next frame.
+      TODO_TAKE();
+      todoSel = todoCount > 0 ? constrain(todoSel + (int)delta, 0, todoCount - 1) : 0;
+      TODO_GIVE();
     } else {
       int p = (int)page + (int)delta;
       while (p < 0) p += PAGE_COUNT;
@@ -1078,9 +1323,10 @@ void setup() {
   attachInterrupt(PIN_ENC_CLK, encISR, CHANGE);
   attachInterrupt(PIN_ENC_DT,  encISR, CHANGE);
 
-  evqLock = xSemaphoreCreateMutex();
-  if (!evqLock) {
-    Serial.println("FATAL: could not create the event queue mutex.");
+  evqLock  = xSemaphoreCreateMutex();
+  todoLock = xSemaphoreCreateMutex();
+  if (!evqLock || !todoLock) {
+    Serial.println("FATAL: could not create the queue mutexes.");
     while (true) delay(1000);
   }
 
