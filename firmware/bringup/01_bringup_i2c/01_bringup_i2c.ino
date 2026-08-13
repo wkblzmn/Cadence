@@ -155,13 +155,23 @@ void loop() {
 
   // verdict
   Serial.print("[=] ");
-  if (total == 0 && !sdaUp && !sclUp)
-    Serial.println("Bus is dead and unpowered — this is a power/ground fault.");
-  else if (!sawBosch && sdaUp && sclUp)
-    Serial.println("Bus is powered and other devices answer, but the Bosch part "
-                   "is silent. Power and wiring are good; the sensor is not.");
-  else if (sawBosch)
+  if (sawBosch) {
     Serial.println("Bosch sensor is present. Check the chip ID line above.");
+  } else if (!sdaUp || !sclUp) {
+    Serial.println("No powered pull-up on the bus — this is a power/ground "
+                   "fault, not a dead chip. Fix VIN/GND first.");
+  } else if (total == 0) {
+    // Nothing at all answered, yet something is holding the lines up. With
+    // only one module attached those pull-ups are its own, so it has power
+    // and still will not talk: that is a dead part, not a wiring fault.
+    Serial.println("Pull-ups are powered but NOTHING answers at any speed. If "
+                   "this module is the only one on the bus, it has power and "
+                   "is still silent — the chip is dead.");
+  } else {
+    Serial.println("Bus is powered and other devices answer, but the Bosch "
+                   "part is silent. Power and wiring are good; the sensor "
+                   "is not.");
+  }
 
   delay(5000);
 }
