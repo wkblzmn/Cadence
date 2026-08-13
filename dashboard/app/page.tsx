@@ -1,5 +1,6 @@
 import { sql } from "@/lib/db";
 import Tasks, { type Todo } from "./tasks";
+import ThemeToggle from "./theme-toggle";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -108,140 +109,135 @@ async function load() {
 
 // ── chart ────────────────────────────────────────────────────────────────
 //
+// Plain HTML and CSS, not SVG. A viewBox scales its text along with its
+// geometry, so the 11px axis labels came out around 6px on a 375px phone —
+// fine in the desktop mock, useless on the device. Laying the columns out
+// with flex keeps every label at a real CSS size at any width while the bars
+// still scale.
+//
 // Single series, so no legend: the card title says what is plotted. One hue
 // for every column — a value-ramp here would double-encode height as darkness
 // and burn the only free channel on information the bar already carries.
 
-const W = 700;
-const H = 200;
-const PAD_L = 46;
-const PAD_R = 12;
-const PAD_T = 24; // headroom for the cap labels
-const AXIS_Y = 158;
-const LABEL_Y = 180;
-
+// Strictly greater, not >=, so the tallest bar never reaches 100% of the plot.
+// A bar at exactly full height would push its own value label out of the plot
+// area and into the card title.
 function niceCeil(seconds: number): number {
   const mins = seconds / 60;
   for (const s of [15, 30, 60, 90, 120, 180, 240, 300, 360, 480, 600, 720]) {
-    if (mins <= s) return s * 60;
+    if (mins < s) return s * 60;
   }
   return Math.ceil(mins / 60) * 3600;
 }
 
-// Rounded at the data end, square at the baseline.
-function barPath(x: number, y: number, w: number, h: number): string {
-  const r = Math.min(4, h);
-  return [
-    `M ${x} ${y + h}`,
-    `L ${x} ${y + r}`,
-    `Q ${x} ${y} ${x + r} ${y}`,
-    `L ${x + w - r} ${y}`,
-    `Q ${x + w} ${y} ${x + w} ${y + r}`,
-    `L ${x + w} ${y + h}`,
-    "Z",
-  ].join(" ");
-}
-
 function FocusChart({ days, today }: { days: Day[]; today: string }) {
-  const plotW = W - PAD_L - PAD_R;
-  const plotH = AXIS_Y - PAD_T;
-  const band = plotW / days.length;
-  const barW = Math.min(24, band - 16);
-
   const peak = Math.max(...days.map((d) => d.focus_seconds));
   const yMax = niceCeil(Math.max(peak, 1));
-  const ticks = [0, yMax / 2, yMax];
+  const ticks = [yMax, yMax / 2, 0];
 
   // Label selectively: today, and the peak day when it is a different column.
   const peakIdx = days.findIndex((d) => d.focus_seconds === peak && peak > 0);
   const todayIdx = days.findIndex((d) => d.day === today);
   const labelled = new Set([peakIdx, todayIdx].filter((i) => i >= 0));
 
+  const plotH = "h-40 sm:h-48";
+  const gutter = "w-9 shrink-0 sm:w-11";
+
   return (
-    <svg
-      viewBox={`0 0 ${W} ${H}`}
-      className="w-full h-auto"
+    <div
       role="img"
       aria-label={`Focus time per day for the last 7 days, ending ${today}. Peak ${fmtDuration(peak)}.`}
     >
-      {ticks.map((t) => {
-        const y = AXIS_Y - (t / yMax) * plotH;
-        return (
-          <g key={t}>
-            <line
-              x1={PAD_L}
-              x2={W - PAD_R}
-              y1={y}
-              y2={y}
-              stroke={t === 0 ? "var(--baseline)" : "var(--gridline)"}
-              strokeWidth="1"
-            />
-            <text
-              x={PAD_L - 10}
-              y={y + 4}
-              textAnchor="end"
-              fontSize="11"
-              fill="var(--text-muted)"
-              style={{ fontVariantNumeric: "tabular-nums" }}
+      <div className="flex gap-2">
+        {/* Ticks are positioned from the same percentage as their gridline
+            rather than spaced evenly, so the two cannot drift apart. */}
+        <div className={`relative ${gutter} ${plotH}`}>
+          {ticks.map((t) => (
+            <span
+              key={t}
+              className="absolute right-0 translate-y-1/2 text-[10px] sm:text-[11px]"
+              style={{
+                bottom: `${(t / yMax) * 100}%`,
+                color: "var(--text-muted)",
+                fontVariantNumeric: "tabular-nums",
+              }}
             >
               {t === 0 ? "0" : fmtDuration(t)}
-            </text>
-          </g>
-        );
-      })}
+            </span>
+          ))}
+        </div>
 
-      {days.map((d, i) => {
-        const h = (d.focus_seconds / yMax) * plotH;
-        const x = PAD_L + i * band + (band - barW) / 2;
-        const y = AXIS_Y - h;
-        const isToday = d.day === today;
-
-        return (
-          <g key={d.day}>
-            <title>
-              {`${weekday(d.day)} ${d.day} — ${fmtDuration(d.focus_seconds)}, ${d.session_count} segment${d.session_count === 1 ? "" : "s"}`}
-            </title>
-
-            {/* Hit target spans the whole band so hover is not pixel-hunting. */}
-            <rect
-              x={PAD_L + i * band}
-              y={PAD_T}
-              width={band}
-              height={AXIS_Y - PAD_T}
-              fill="transparent"
+        <div className={`relative flex-1 ${plotH}`}>
+          {ticks.map((t) => (
+            <div
+              key={t}
+              className="absolute inset-x-0 h-px"
+              style={{
+                bottom: `${(t / yMax) * 100}%`,
+                background: t === 0 ? "var(--baseline)" : "var(--gridline)",
+              }}
             />
+          ))}
 
-            {d.focus_seconds > 0 && (
-              <path d={barPath(x, y, barW, h)} fill="var(--series-1)" />
-            )}
+          <div className="absolute inset-0 flex items-end">
+            {days.map((d, i) => {
+              const pct = (d.focus_seconds / yMax) * 100;
+              return (
+                // The hover target is the whole column, not the bar, so a
+                // near-empty day is not a pixel hunt.
+                <div
+                  key={d.day}
+                  className="relative h-full flex-1"
+                  title={`${weekday(d.day)} ${d.day} — ${fmtDuration(d.focus_seconds)}, ${d.session_count} segment${d.session_count === 1 ? "" : "s"}`}
+                >
+                  {d.focus_seconds > 0 && (
+                    <div
+                      className="absolute bottom-0 left-1/2 w-6 max-w-[60%] -translate-x-1/2"
+                      style={{
+                        height: `${pct}%`,
+                        background: "var(--series-1)",
+                        borderRadius: "4px 4px 0 0",
+                      }}
+                    />
+                  )}
 
-            {labelled.has(i) && d.focus_seconds > 0 && (
-              <text
-                x={x + barW / 2}
-                y={y - 8}
-                textAnchor="middle"
-                fontSize="11"
-                fontWeight="600"
-                fill="var(--text-secondary)"
-              >
-                {fmtDuration(d.focus_seconds)}
-              </text>
-            )}
+                  {labelled.has(i) && d.focus_seconds > 0 && (
+                    <span
+                      className="absolute left-1/2 -translate-x-1/2 whitespace-nowrap text-[10px] font-semibold sm:text-[11px]"
+                      style={{
+                        bottom: `calc(${pct}% + 4px)`,
+                        color: "var(--text-secondary)",
+                      }}
+                    >
+                      {fmtDuration(d.focus_seconds)}
+                    </span>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      </div>
 
-            <text
-              x={PAD_L + i * band + band / 2}
-              y={LABEL_Y}
-              textAnchor="middle"
-              fontSize="11"
-              fill={isToday ? "var(--text-secondary)" : "var(--text-muted)"}
-              fontWeight={isToday ? 600 : 400}
+      <div className="mt-2 flex gap-2">
+        <div className={gutter} />
+        <div className="flex flex-1">
+          {days.map((d) => (
+            <div
+              key={d.day}
+              className="flex-1 text-center text-[10px] sm:text-[11px]"
+              style={{
+                color:
+                  d.day === today ? "var(--text-secondary)" : "var(--text-muted)",
+                fontWeight: d.day === today ? 600 : 400,
+              }}
             >
               {weekday(d.day)}
-            </text>
-          </g>
-        );
-      })}
-    </svg>
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
   );
 }
 
@@ -258,7 +254,7 @@ function Card({
 }) {
   return (
     <section
-      className={`rounded-xl border p-5 ${className}`}
+      className={`rounded-xl border p-4 sm:p-5 ${className}`}
       style={{
         background: "var(--surface-1)",
         borderColor: "var(--hairline)",
@@ -367,15 +363,23 @@ export default async function Home() {
     reading && reading[k] !== null ? Number(reading[k]) : null;
 
   return (
-    <main className="mx-auto w-full max-w-5xl px-6 py-10">
-      <header className="mb-8 flex flex-wrap items-center justify-between gap-3">
-        <div>
+    <main className="mx-auto w-full max-w-5xl px-4 py-6 sm:px-6 sm:py-10">
+      <header className="mb-6 flex flex-wrap items-center justify-between gap-3 sm:mb-8">
+        <div className="min-w-0">
           <h1 className="text-xl font-semibold tracking-tight">Cadence</h1>
-          <p className="text-sm" style={{ color: "var(--text-muted)" }}>
+          {/* The device line wraps rather than truncating — on a phone it is
+              three separate facts, not one string. */}
+          <p
+            className="text-xs sm:text-sm"
+            style={{ color: "var(--text-muted)" }}
+          >
             {DEVICE_ID} · {TZ} · {today}
           </p>
         </div>
-        <StatusChip ageSeconds={age} />
+        <div className="flex flex-wrap items-center gap-2">
+          <StatusChip ageSeconds={age} />
+          <ThemeToggle />
+        </div>
       </header>
 
       {/* Hero — the one number the view leads with. */}
@@ -383,10 +387,10 @@ export default async function Home() {
         <div className="text-xs" style={{ color: "var(--text-muted)" }}>
           Focused today
         </div>
-        <div className="mt-1 text-6xl font-semibold tracking-tight">
+        <div className="mt-1 text-5xl font-semibold tracking-tight sm:text-6xl">
           {fmtDuration(todaySeconds)}
         </div>
-        <div className="mt-6 grid grid-cols-2 gap-6 sm:grid-cols-3">
+        <div className="mt-5 grid grid-cols-2 gap-4 sm:mt-6 sm:grid-cols-3 sm:gap-6">
           <Stat label="Longest stretch" value={fmtDuration(longestToday)} />
           <Stat
             label="Segments today"

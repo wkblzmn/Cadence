@@ -53,8 +53,10 @@ function Row({
   last: boolean;
 }) {
   return (
+    // flex-wrap, so on a narrow phone the title takes the full width and the
+    // controls drop to a second line instead of squeezing the input to nothing.
     <li
-      className="flex items-center gap-2 border-b py-2 last:border-b-0"
+      className="flex flex-wrap items-center gap-1 border-b py-2 last:border-b-0 sm:flex-nowrap sm:gap-2"
       style={{ borderColor: "var(--hairline)" }}
     >
       <form action={setDone}>
