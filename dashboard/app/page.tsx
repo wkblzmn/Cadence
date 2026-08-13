@@ -1,4 +1,5 @@
 import { sql } from "@/lib/db";
+import Tasks, { type Todo } from "./tasks";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -72,11 +73,10 @@ async function load() {
         from readings_latest
         where device_id = ${DEVICE_ID}`,
       sql`
-        select id, title
+        select id, title, position, done
         from todos
-        where done = false
-        order by position asc, updated_at asc
-        limit 12`,
+        order by done asc, position asc, updated_at asc
+        limit 200`,
     ]);
 
   const today = String(todayRows[0].today);
@@ -97,7 +97,12 @@ async function load() {
     days,
     longestToday: num(stretchRows[0]?.longest_seconds),
     reading: readingRows[0] ?? null,
-    todos: todoRows as Array<{ id: string; title: string }>,
+    todos: todoRows.map<Todo>((r) => ({
+      id: String(r.id),
+      title: String(r.title),
+      position: num(r.position),
+      done: Boolean(r.done),
+    })),
   };
 }
 
@@ -451,23 +456,7 @@ export default async function Home() {
         </Card>
 
         <Card title="Tasks">
-          {todos.length === 0 ? (
-            <p className="text-sm" style={{ color: "var(--text-muted)" }}>
-              Nothing open. Add one with{" "}
-              <code className="text-xs">POST /api/todos</code>.
-            </p>
-          ) : (
-            <ul className="space-y-2">
-              {todos.map((t) => (
-                <li key={t.id} className="flex items-start gap-2 text-sm">
-                  <span aria-hidden style={{ color: "var(--text-muted)" }}>
-                    ○
-                  </span>
-                  <span>{t.title}</span>
-                </li>
-              ))}
-            </ul>
-          )}
+          <Tasks todos={todos} />
         </Card>
       </div>
     </main>
