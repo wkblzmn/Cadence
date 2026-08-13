@@ -683,9 +683,12 @@ bool todoScrollMode = false;
 
 // ═══════════════════════════════════════════════════ pages
 
-enum Page : uint8_t { PAGE_CLOCK, PAGE_ENV, PAGE_TIMER, PAGE_TODO, PAGE_FACE, PAGE_COUNT };
-uint8_t page = PAGE_CLOCK;
-const char *pageName[PAGE_COUNT] = { "CLOCK", "ENVIRONMENT", "FOCUS", "TASKS", "CADENCE" };
+// UI redesign, approved 2026-08-10, built after Wi-Fi + NTP landed as the
+// build order required. Five pages collapse to three: a desk device you glance
+// at should not require turning a knob to see the temperature.
+enum Page : uint8_t { PAGE_HOME, PAGE_TASKS, PAGE_STATUS, PAGE_COUNT };
+uint8_t page = PAGE_HOME;
+const char *pageName[PAGE_COUNT] = { "HOME", "TASKS", "STATUS & SESSION" };
 
 // ─────────────────────────────────────────── chrome
 
@@ -713,129 +716,165 @@ static void drawPageDots() {
 
 // ─────────────────────────────────────────── page bodies
 
-static void pageClock() {
-  char buf[40];
-  canvas.setTextDatum(middle_center);
+static void fmtHMS(uint32_t ms, char *out, size_t n) {
+  uint32_t s = ms / 1000;
+  snprintf(out, n, "%02lu:%02lu:%02lu",
+           (unsigned long)(s / 3600), (unsigned long)((s / 60) % 60),
+           (unsigned long)(s % 60));
+}
 
+// Character face, re-sized for the 296x92 band on Home instead of a full
+// screen. Blink on a timer; expression follows the timer state.
+//
+// Measured against the band (y 82..174): eyes sit at cy-14 with r16, so they
+// span 98..130; the smile bottoms out at cy+26+10 plus its 3px pen, so 167.
+// Both clear the band with room, which is what keeps the face from colliding
+// with the environment row above or the bottom bar below.
+static void drawFace(int cx, int cy) {
+  static uint32_t nextBlink = 3000;
+  static uint32_t blinkEnd  = 0;
+  uint32_t now = millis();
+
+  if (now > nextBlink) { blinkEnd = now + 130; nextBlink = now + random(2600, 5200); }
+  bool blinking = now < blinkEnd;
+
+  const int eyeDx = 46, eyeR = 16;
+  const int ey = cy - 14;
+
+  uint16_t col = timerState == T_RUNNING ? C_GOOD
+               : timerState == T_PAUSED  ? C_WARN : C_FACE;
+
+  if (blinking) {
+    canvas.fillRoundRect(cx - eyeDx - eyeR, ey - 3, eyeR * 2, 6, 3, col);
+    canvas.fillRoundRect(cx + eyeDx - eyeR, ey - 3, eyeR * 2, 6, 3, col);
+  } else if (timerState == T_RUNNING) {
+    // Narrowed — concentrating.
+    canvas.fillRoundRect(cx - eyeDx - eyeR, ey - 8, eyeR * 2, 16, 6, col);
+    canvas.fillRoundRect(cx + eyeDx - eyeR, ey - 8, eyeR * 2, 16, 6, col);
+  } else {
+    canvas.fillCircle(cx - eyeDx, ey, eyeR, col);
+    canvas.fillCircle(cx + eyeDx, ey, eyeR, col);
+  }
+
+  int my = cy + 26;
+  if (timerState == T_RUNNING) {
+    canvas.fillRoundRect(cx - 26, my - 3, 52, 6, 3, col);          // flat, focused
+  } else if (timerState == T_PAUSED) {
+    canvas.fillRoundRect(cx - 20, my - 3, 40, 6, 3, col);
+  } else {
+    for (int i = -30; i <= 30; i++)                                 // gentle smile
+      canvas.fillCircle(cx + i, my + (int)(10 - i * i / 90.0f), 3, col);
+  }
+}
+
+// Page 01 — Home. Everything ambient on one screen, so the common case needs
+// no navigation at all.
+//
+// Vertical budget for the 240px panel:
+//   0..51    top strip   clock left, labelled timer right
+//   52..79   environment row
+//   82..174  face band, 296 x 92
+//   ~200     bottom bar  tasks remaining left, vision pill right
+//   230      page dots
+static void pageHome() {
+  char buf[40];
+
+  // ── top strip ──────────────────────────────────────────────────────────
+  // 24-hour is mandatory, not a preference. Font7 HH:MM is ~126px and an
+  // AM/PM suffix adds ~24px; with the timer beside it the row overflows 320.
+  // Seconds are dropped for the same reason — HH:MM:SS runs to ~200px, which
+  // leaves nothing for the timer. Seconds still tick on the Status page.
+  canvas.setFont(&fonts::Font7);
+  canvas.setTextDatum(middle_left);
   if (timeValid) {
     time_t now = time(nullptr);
     struct tm lt;
     localtime_r(&now, &lt);
-
-    // 24-hour. Confirmed by pixel arithmetic: AM/PM does not fit this row.
-    snprintf(buf, sizeof(buf), "%02d:%02d:%02d", lt.tm_hour, lt.tm_min, lt.tm_sec);
-    canvas.setFont(&fonts::Font7);
+    snprintf(buf, sizeof(buf), "%02d:%02d", lt.tm_hour, lt.tm_min);
     canvas.setTextColor(C_TEXT, C_BG);
-    canvas.drawString(buf, SCREEN_W / 2, 100);
-
-    strftime(buf, sizeof(buf), "%a %d %b %Y", &lt);
-    canvas.setFont(&fonts::Font4);
-    canvas.setTextColor(C_DIM, C_BG);
-    canvas.drawString(buf, SCREEN_W / 2, 150);
   } else {
-    uint32_t s = millis() / 1000;
-    snprintf(buf, sizeof(buf), "%02lu:%02lu:%02lu",
-             (unsigned long)(s / 3600), (unsigned long)((s / 60) % 60),
-             (unsigned long)(s % 60));
-    canvas.setFont(&fonts::Font7);
+    snprintf(buf, sizeof(buf), "--:--");
     canvas.setTextColor(C_DIM, C_BG);
-    canvas.drawString(buf, SCREEN_W / 2, 100);
-
-    canvas.setFont(&fonts::Font2);
-    canvas.setTextColor(C_WARN, C_BG);
-    canvas.drawString("UPTIME - waiting for NTP", SCREEN_W / 2, 150);
   }
+  canvas.drawString(buf, 10, 28);
 
-  // Network status. Worth a line on screen: this is the first thing to check
-  // when the dashboard stops receiving.
   canvas.setFont(&fonts::Font2);
-  if (netState == NET_UP) {
-    snprintf(buf, sizeof(buf), "wifi %s  %ddBm%s",
-             WiFi.localIP().toString().c_str(), WiFi.RSSI(),
-             timeValid ? "  ntp ok" : "  ntp...");
-    canvas.setTextColor(C_GOOD, C_BG);
-  } else if (netState == NET_CONNECTING) {
-    snprintf(buf, sizeof(buf), "connecting to %s", WIFI_SSID);
-    canvas.setTextColor(C_WARN, C_BG);
-  } else {
-    snprintf(buf, sizeof(buf), "wifi down - retry %u", netRetryCount);
-    canvas.setTextColor(C_WARN, C_BG);
-  }
-  canvas.drawString(buf, SCREEN_W / 2, 190);
-
-  uint8_t depth = evqDepth();
-  if (depth > 0) {
-    snprintf(buf, sizeof(buf), "%u event%s queued", depth, depth == 1 ? "" : "s");
-    canvas.setTextColor(C_WARN, C_BG);
-    canvas.drawString(buf, SCREEN_W / 2, 208);
-  } else if (apiLastOk) {
-    uint32_t agoS = (millis() - apiLastOk) / 1000;
-    if (agoS < 120) snprintf(buf, sizeof(buf), "synced %lus ago", (unsigned long)agoS);
-    else            snprintf(buf, sizeof(buf), "synced %lum ago", (unsigned long)(agoS / 60));
-    canvas.setTextColor(C_GOOD, C_BG);
-    canvas.drawString(buf, SCREEN_W / 2, 208);
-  } else if (netState == NET_UP && timeValid) {
-    snprintf(buf, sizeof(buf), "backend unreachable (%d)", apiLastStatus);
-    canvas.setTextColor(C_WARN, C_BG);
-    canvas.drawString(buf, SCREEN_W / 2, 208);
-  }
-}
-
-static void envRow(int y, const char *label, const char *value, uint16_t col) {
-  canvas.setFont(&fonts::Font2);
-  canvas.setTextDatum(middle_left);
-  canvas.setTextColor(C_DIM, C_BG);
-  canvas.drawString(label, 24, y);
   canvas.setTextDatum(middle_right);
-  canvas.setTextColor(col, C_BG);
+  canvas.setTextColor(timerState == T_RUNNING ? C_GOOD
+                    : timerState == T_PAUSED  ? C_WARN : C_DIM, C_BG);
+  canvas.drawString(timerState == T_RUNNING ? "FOCUS"
+                  : timerState == T_PAUSED  ? "PAUSED" : "IDLE",
+                    SCREEN_W - 10, 14);
+
+  // The timer sits in Font4, not Font7, so the clock dominates the strip.
+  fmtHMS(sessionElapsedMs(), buf, sizeof(buf));
   canvas.setFont(&fonts::Font4);
-  canvas.drawString(value, SCREEN_W - 24, y);
-}
+  canvas.setTextColor(timerState == T_IDLE ? C_DIM : C_TEXT, C_BG);
+  canvas.drawString(buf, SCREEN_W - 10, 38);
 
-static void pageEnv() {
-  char buf[24];
+  // ── environment row ────────────────────────────────────────────────────
+  // Temperature · humidity · real feel. No weather box: §1 is explicit that
+  // the device senses the room, and an external API would duplicate readings
+  // already taken locally with better provenance.
+  canvas.setFont(&fonts::Font2);
 
-  if (bmeOk) {
-    snprintf(buf, sizeof(buf), "%.1f C", tempC);      envRow(50,  "Temperature", buf, C_TEXT);
-    snprintf(buf, sizeof(buf), "%.0f %%", humidity);  envRow(86,  "Humidity",    buf, C_TEXT);
-    snprintf(buf, sizeof(buf), "%.0f hPa", pressHpa); envRow(122, "Pressure",    buf, C_TEXT);
-    snprintf(buf, sizeof(buf), "%.1f C", realFeelC);  envRow(158, "Real feel",   buf, C_ACCENT);
-  } else {
-    envRow(50,  "Temperature", "--", C_DIM);
-    envRow(86,  "Humidity",    "--", C_DIM);
-    envRow(122, "Pressure",    "--", C_DIM);
-    envRow(158, "Real feel",   "--", C_DIM);
-    canvas.setFont(&fonts::Font2);
-    canvas.setTextDatum(middle_center);
-    canvas.setTextColor(C_WARN, C_BG);
-    canvas.drawString("BME280 not on the bus", SCREEN_W / 2, 200);
-  }
-
-  snprintf(buf, sizeof(buf), "%.0f lx", lux);
-  envRow(194, "Light", buf, luxOk ? C_TEXT : C_DIM);
-}
-
-static void pageTimer() {
-  uint32_t s = sessionElapsedMs() / 1000;
-  char buf[16];
-  snprintf(buf, sizeof(buf), "%02lu:%02lu:%02lu",
-           (unsigned long)(s / 3600), (unsigned long)((s / 60) % 60),
-           (unsigned long)(s % 60));
+  canvas.setTextDatum(middle_left);
+  canvas.setTextColor(bmeOk ? C_TEXT : C_DIM, C_BG);
+  if (bmeOk) snprintf(buf, sizeof(buf), "%.1f C", tempC);
+  else       snprintf(buf, sizeof(buf), "-- C");
+  canvas.drawString(buf, 12, 66);
 
   canvas.setTextDatum(middle_center);
-  canvas.setFont(&fonts::Font7);
-  canvas.setTextColor(timerState == T_RUNNING ? C_GOOD : C_TEXT, C_BG);
-  canvas.drawString(buf, SCREEN_W / 2, 105);
+  if (bmeOk) snprintf(buf, sizeof(buf), "%.0f %%", humidity);
+  else       snprintf(buf, sizeof(buf), "-- %%");
+  canvas.drawString(buf, SCREEN_W / 2, 66);
+
+  canvas.setTextDatum(middle_right);
+  canvas.setTextColor(bmeOk ? C_ACCENT : C_DIM, C_BG);
+  if (bmeOk) snprintf(buf, sizeof(buf), "feels %.1f C", realFeelC);
+  else       snprintf(buf, sizeof(buf), "feels --");
+  canvas.drawString(buf, SCREEN_W - 12, 66);
+
+  // ── middle band, 296 x 92 ──────────────────────────────────────────────
+  // The redesign costs us the full-screen timer. Rather than add a page back,
+  // the band becomes the timer while a session runs: same page, different
+  // state, no extra navigation.
+  const int bandY = 82, bandH = 92;
+  const int bandCx = SCREEN_W / 2, bandCy = bandY + bandH / 2;
+
+  if (timerState == T_IDLE) {
+    drawFace(bandCx, bandCy);
+  } else {
+    fmtHMS(sessionElapsedMs(), buf, sizeof(buf));
+    canvas.setFont(&fonts::Font7);
+    canvas.setTextDatum(middle_center);
+    canvas.setTextColor(timerState == T_RUNNING ? C_GOOD : C_WARN, C_BG);
+    canvas.drawString(buf, bandCx, bandCy);
+  }
+
+  // ── bottom bar ─────────────────────────────────────────────────────────
+  int remaining = 0;
+  for (int i = 0; i < todoCount; i++) if (!todos[i].done) remaining++;
 
   canvas.setFont(&fonts::Font2);
-  canvas.setTextColor(C_DIM, C_BG);
-  canvas.drawString(timerState == T_IDLE ? "Press button to start"
-                  : timerState == T_RUNNING ? "Press to pause  -  hold to stop"
-                                            : "Press to resume  -  hold to stop",
-                    SCREEN_W / 2, 170);
+  canvas.setTextDatum(middle_left);
+  canvas.setTextColor(remaining ? C_TEXT : C_DIM, C_BG);
+  snprintf(buf, sizeof(buf), "%d task%s left", remaining, remaining == 1 ? "" : "s");
+  canvas.drawString(buf, 12, 200);
+
+  // Vision is Phase 4. Until the phone posts focus samples the honest state is
+  // standalone, so the pill says so rather than implying a tier that is not
+  // running.
+  const int pillW = 104, pillH = 22;
+  const int pillX = SCREEN_W - 12 - pillW, pillY = 200 - pillH / 2;
+  canvas.fillRoundRect(pillX, pillY, pillW, pillH, pillH / 2, C_PANEL);
+  canvas.setTextDatum(middle_center);
+  canvas.setTextColor(C_DIM, C_PANEL);
+  canvas.drawString("STANDALONE", pillX + pillW / 2, 200);
 }
 
-static void pageTodo() {
+// Page 02 — Tasks. Unchanged by the redesign.
+static void pageTasks() {
   const int rowH = 30, top = 34, visible = 5;
   int first = todoSel - visible / 2;
   if (first < 0) first = 0;
@@ -866,56 +905,93 @@ static void pageTodo() {
                     SCREEN_W / 2, SCREEN_H - 28);
 }
 
-// Character face. Blink on a timer; expression follows the timer state.
-static void pageFace() {
-  static uint32_t nextBlink = 3000;
-  static uint32_t blinkEnd  = 0;
-  uint32_t now = millis();
+static void statusRow(int y, const char *label, const char *value, uint16_t col) {
+  canvas.setFont(&fonts::Font2);
+  canvas.setTextDatum(middle_left);
+  canvas.setTextColor(C_DIM, C_BG);
+  canvas.drawString(label, 12, y);
+  canvas.setTextDatum(middle_right);
+  canvas.setTextColor(col, C_BG);
+  canvas.drawString(value, SCREEN_W - 12, y);
+}
 
-  if (now > nextBlink) { blinkEnd = now + 130; nextBlink = now + random(2600, 5200); }
-  bool blinking = now < blinkEnd;
+// Page 03 — Status & session. §8's session view in miniature: everything you
+// need to answer "why is the dashboard not receiving?" without a serial cable.
+static void pageStatus() {
+  char buf[64];
 
-  const int cx = SCREEN_W / 2, cy = 112;
-  const int eyeDx = 52, eyeR = 20;
-
-  uint16_t col = timerState == T_RUNNING ? C_GOOD
-               : timerState == T_PAUSED  ? C_WARN : C_FACE;
-
-  if (blinking) {
-    canvas.fillRoundRect(cx - eyeDx - eyeR, cy - 4, eyeR * 2, 8, 4, col);
-    canvas.fillRoundRect(cx + eyeDx - eyeR, cy - 4, eyeR * 2, 8, 4, col);
-  } else if (timerState == T_RUNNING) {
-    // Narrowed — concentrating.
-    canvas.fillRoundRect(cx - eyeDx - eyeR, cy - 10, eyeR * 2, 20, 8, col);
-    canvas.fillRoundRect(cx + eyeDx - eyeR, cy - 10, eyeR * 2, 20, 8, col);
+  if (netState == NET_UP) {
+    snprintf(buf, sizeof(buf), "%s  %ddBm",
+             WiFi.localIP().toString().c_str(), WiFi.RSSI());
+    statusRow(44, "Wi-Fi", buf, C_GOOD);
+  } else if (netState == NET_CONNECTING) {
+    snprintf(buf, sizeof(buf), "connecting to %s", WIFI_SSID);
+    statusRow(44, "Wi-Fi", buf, C_WARN);
   } else {
-    canvas.fillCircle(cx - eyeDx, cy, eyeR, col);
-    canvas.fillCircle(cx + eyeDx, cy, eyeR, col);
+    snprintf(buf, sizeof(buf), "down - retry %u", netRetryCount);
+    statusRow(44, "Wi-Fi", buf, C_WARN);
   }
 
-  int my = cy + 56;
-  if (timerState == T_RUNNING) {
-    canvas.fillRoundRect(cx - 26, my - 3, 52, 6, 3, col);          // flat, focused
-  } else if (timerState == T_PAUSED) {
-    canvas.fillRoundRect(cx - 20, my - 3, 40, 6, 3, col);
+  if (timeValid) {
+    time_t now = time(nullptr);
+    struct tm lt;
+    localtime_r(&now, &lt);
+    snprintf(buf, sizeof(buf), "%02d:%02d:%02d local",
+             lt.tm_hour, lt.tm_min, lt.tm_sec);
+    statusRow(70, "NTP", buf, C_GOOD);
   } else {
-    for (int i = -30; i <= 30; i++)                                 // gentle smile
-      canvas.fillCircle(cx + i, my + (int)(10 - i * i / 90.0f), 3, col);
+    statusRow(70, "NTP", "waiting for sync", C_WARN);
   }
+
+  statusRow(96, "BME280", bmeOk ? "ok" : "absent", bmeOk ? C_GOOD : C_WARN);
+
+  if (luxOk) snprintf(buf, sizeof(buf), "ok  %.0f lx", lux);
+  else       snprintf(buf, sizeof(buf), "absent");
+  statusRow(122, "BH1750", buf, luxOk ? C_GOOD : C_WARN);
+
+  // Order matters here. The previous version showed "synced Nm ago" whenever
+  // there had EVER been a success, so the screen read healthy while every
+  // current request was failing — which is exactly how a dead link hid for an
+  // afternoon. A live failure now outranks any past success.
+  uint8_t depth = evqDepth();
+  if (depth > 0) {
+    snprintf(buf, sizeof(buf), "%u event%s queued", depth, depth == 1 ? "" : "s");
+    statusRow(148, "Backend", buf, C_WARN);
+  } else if (apiFailCount > 0) {
+    snprintf(buf, sizeof(buf), "failing (%d)", apiLastStatus);
+    statusRow(148, "Backend", buf, C_WARN);
+  } else if (apiLastOk) {
+    uint32_t agoS = (millis() - apiLastOk) / 1000;
+    if (agoS < 120) snprintf(buf, sizeof(buf), "synced %lus ago", (unsigned long)agoS);
+    else            snprintf(buf, sizeof(buf), "synced %lum ago", (unsigned long)(agoS / 60));
+    statusRow(148, "Backend", buf, C_GOOD);
+  } else {
+    statusRow(148, "Backend", "no sync yet", C_DIM);
+  }
+
+  // Current session only. §4 keeps totals on the server, and the hub has no
+  // GET client yet, so today's figure belongs here once it can fetch it —
+  // inventing one on-device is exactly what §4 forbids.
+  fmtHMS(sessionElapsedMs(), buf, sizeof(buf));
+  statusRow(174, "Session", buf,
+            timerState == T_RUNNING ? C_GOOD
+          : timerState == T_PAUSED  ? C_WARN : C_DIM);
 }
 
 // ─────────────────────────────────────────── frame
 
 static void render() {
   canvas.fillScreen(C_BG);
-  drawStatusBar();
+
+  // Home carries its own chrome — the clock strip is the header, and a title
+  // bar on top of it would cost 22px the layout does not have. The other two
+  // keep the bar so the page name and timer state stay visible.
+  if (page != PAGE_HOME) drawStatusBar();
 
   switch (page) {
-    case PAGE_CLOCK: pageClock(); break;
-    case PAGE_ENV:   pageEnv();   break;
-    case PAGE_TIMER: pageTimer(); break;
-    case PAGE_TODO:  pageTodo();  break;
-    case PAGE_FACE:  pageFace();  break;
+    case PAGE_HOME:   pageHome();   break;
+    case PAGE_TASKS:  pageTasks();  break;
+    case PAGE_STATUS: pageStatus(); break;
   }
 
   drawPageDots();
@@ -945,7 +1021,7 @@ static void handleInput() {
 
   switch (encSw.poll()) {
     case BTN_SHORT:
-      if (page == PAGE_TODO) todoScrollMode = !todoScrollMode;
+      if (page == PAGE_TASKS) todoScrollMode = !todoScrollMode;
       break;
     case BTN_LONG:
       todoScrollMode = false;
