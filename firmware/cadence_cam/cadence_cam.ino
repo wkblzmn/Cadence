@@ -59,6 +59,12 @@
 //
 // Port 80: control. Always answers.
 // Port 81: MJPEG, driven by its own task.
+// The focus relay does a TLS handshake from inside a WebServer handler, which
+// runs on the Arduino loop task. That handshake wants roughly 6 KB of stack
+// and the default loop task has 8 KB — too close to rely on, and a stack
+// overflow here would look like a random reboot whenever a sample is posted.
+SET_LOOP_TASK_STACK_SIZE(16 * 1024);
+
 WebServer  server(80);
 WiFiServer streamServer(81);
 
@@ -431,6 +437,30 @@ static void handleSet() {
 }
 
 // ── vision page and the focus relay ──────────────────────────────────────
+
+// One client of each kind, shared by every outbound request. A second
+// WiFiClientSecure means a second mbedTLS context, and the handshake is
+// already the largest thing this board allocates.
+//
+// Certificate validation is skipped — the same documented deviation the hub
+// makes: pinning a CA bundle costs flash and needs rotating when the CA does.
+static WiFiClientSecure tlsClient;
+static WiFiClient       plainClient;
+
+static bool httpBegin(HTTPClient &http, const String &url) {
+  bool opened;
+  if (url.startsWith("https://")) {
+    tlsClient.setInsecure();
+    tlsClient.setTimeout(10);
+    opened = http.begin(tlsClient, url);
+  } else {
+    opened = http.begin(plainClient, url);
+  }
+  if (!opened) return false;
+  http.setConnectTimeout(5000);
+  http.setTimeout(10000);
+  return true;
+}
 
 static void handleVision() {
   cors();
