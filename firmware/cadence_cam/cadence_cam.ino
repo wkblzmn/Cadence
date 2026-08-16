@@ -150,11 +150,19 @@ static bool camStart() {
     s->set_gain_ctrl(s, 1);                // AGC on, to spend that headroom
     s->set_ae_level(s, 2);                 // aim brighter; gain pays, not time
     s->set_brightness(s, 1);
-    s->set_contrast(s, 1);                 // gain flattens the image; lift it
-    s->set_sharpness(s, 1);
-    s->set_lenc(s, 1);                     // the corners fall off without it
-    s->set_raw_gma(s, 1);
   }
+
+  // Deliberately NOT setting contrast, sharpness, lenc or raw_gma here.
+  //
+  // Those four went in together and the image went black. raw_gma is the one
+  // that could not be ruled out from a browser, because it was the only tweak
+  // with no live control — so every attempt to neutralise the settings left
+  // it stuck at my value, and it survived power cycles too. Gamma applied
+  // wrongly crushes everything to black no matter what the exposure does.
+  //
+  // The rule this earns: do not set anything at init that cannot also be
+  // changed at runtime, or the first thing you cannot rule out is your own
+  // default. All four are available through /set for anyone who wants them.
   return true;
 }
 
@@ -317,6 +325,13 @@ static void handleSet() {
   // model trying to find a face near an edge.
   if (server.hasArg("lenc")) {
     s->set_lenc(s, server.arg("lenc") != "0");
+  }
+
+  // Gamma on the raw data. Exposed because it had to be: with no live control
+  // it was the one setting that could not be ruled out while debugging a
+  // black image, and it turned out to be the cause.
+  if (server.hasArg("gma")) {
+    s->set_raw_gma(s, server.arg("gma") != "0");
   }
 
   // Raising this lets AGC buy more brightness with gain. Costs noise, not fps.
