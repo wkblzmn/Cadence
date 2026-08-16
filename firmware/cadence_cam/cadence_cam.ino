@@ -115,6 +115,18 @@ static bool cameraBegin() {
     s->set_brightness(s, 1);
     s->set_saturation(s, -2);
   }
+
+  // Favour frame rate over exposure from the start. This device lives on a
+  // desk that is often dim — the light sensor next door has been reporting
+  // single-digit lux — and left to itself the sensor lengthens exposure until
+  // the stream drops to a few frames a second. Gain is the cheaper currency
+  // here: the model wants a current frame more than a clean one. Reversible
+  // at runtime with /set?fast=0.
+  if (s) {
+    s->set_aec2(s, 0);
+    s->set_gainceiling(s, GAINCEILING_16X);
+    s->set_gain_ctrl(s, 1);
+  }
   return true;
 }
 
@@ -180,6 +192,24 @@ static void handleSet() {
     int q = server.arg("q").toInt();
     if (q < 4 || q > 63) { server.send(400, "text/plain", "q: 4-63, lower is better"); return; }
     s->set_quality(s, q);
+  }
+
+  // Low-light frame rate. This is the control that actually matters on a
+  // desk at night: with auto-exposure free to lengthen the exposure, the
+  // sensor buys brightness with time and the frame rate collapses — a few
+  // lux gives a few fps, which reads as "the stream is laggy" and is in fact
+  // the sensor doing its job.
+  //
+  // fast=1 turns off aec2 (the extended night-mode exposure) and raises the
+  // gain ceiling, so the sensor buys brightness with gain instead. Noisier
+  // and faster. For gaze and head pose that is the right trade — the model
+  // needs a current frame far more than a clean one.
+  if (server.hasArg("fast")) {
+    bool fast = server.arg("fast") != "0";
+    s->set_aec2(s, fast ? 0 : 1);
+    s->set_gainceiling(s, fast ? GAINCEILING_16X : GAINCEILING_2X);
+    s->set_gain_ctrl(s, 1);        // leave AGC on to use that headroom
+    s->set_exposure_ctrl(s, 1);
   }
 
   server.send(200, "text/plain", "ok");
