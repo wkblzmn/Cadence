@@ -1,5 +1,8 @@
 # ── credentials — the only truly important lines in this file ────────────
-firmware/cadence_hub/secrets.h
+# Glob, not one path: this used to name the hub's file alone, so a second
+# board's secrets.h would have been committed to a public repo by default.
+firmware/**/secrets.h
+secrets.h
 dashboard/.env.local
 dashboard/.env*.local
 .env
