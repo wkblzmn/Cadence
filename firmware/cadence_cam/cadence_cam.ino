@@ -96,12 +96,22 @@ static void camConfigure(framesize_t fs) {
   cfg.ledc_timer   = LEDC_TIMER_0;
   cfg.ledc_channel = LEDC_CHANNEL_0;
 
-  // VGA, not the OV3660's full 3MP. Face landmarking does not benefit from
-  // more pixels, and every extra pixel is bandwidth on a shared Wi-Fi link
-  // and decode time on the phone.
+  // VGA, and deliberately not higher. MediaPipe's face pipeline downscales
+  // its input to a few hundred pixels square before inference — a detector
+  // crop feeding a landmark model — so resolution above roughly VGA is
+  // discarded by the consumer before it is looked at. Measured on this board:
+  // XGA is no faster and no more useful, it is just more bytes.
+  //
+  // Below VGA is worse, not better. QVGA and CIF measured ZERO frames: this
+  // is a 3MP sensor and small sizes engage a scaler path that stalls. On this
+  // part, asking for less is asking for slower.
+  //
+  // Quality 8 rather than 12: bandwidth peaked at 0.5 Mbps across every
+  // configuration tested, so there is nothing to save by compressing harder,
+  // and JPEG blocking costs exactly the fine structure a landmarker uses.
   cfg.pixel_format = PIXFORMAT_JPEG;
   cfg.frame_size   = fs;
-  cfg.jpeg_quality = 12;
+  cfg.jpeg_quality = 8;
   cfg.fb_count     = 2;
   cfg.fb_location  = CAMERA_FB_IN_PSRAM;
   // LATEST, not WHEN_EMPTY: a viewer that falls behind should skip frames
