@@ -68,6 +68,12 @@ create unique index if not exists session_events_dedupe_idx
 create unique index if not exists readings_dedupe_idx
   on readings (device_id, ts);
 
+-- Same guard for focus samples. Nothing writes to this table yet, but the
+-- phone will batch-POST it over a link that drops exactly like the hub's, and
+-- a retried batch without this quietly doubles every attention figure.
+create unique index if not exists focus_samples_dedupe_idx
+  on focus_samples (device_id, ts);
+
 
 -- ═══════════════════════════════════════════ part 2 — the fold
 

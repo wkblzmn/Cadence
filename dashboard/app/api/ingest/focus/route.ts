@@ -42,7 +42,10 @@ export async function POST(req: Request) {
       }
     });
 
-    await sql`
+    // ON CONFLICT makes a retried batch a no-op instead of a second copy, and
+    // `inserted` says which happened — answering 201 identically either way is
+    // how a stalled writer stayed invisible on the readings route.
+    const inserted = await sql`
       insert into focus_samples (device_id, ts, state, confidence)
       select ${deviceId}, t.ts, t.state, t.confidence
       from unnest(
@@ -50,9 +53,14 @@ export async function POST(req: Request) {
         ${rows.map(r => r.state)}::text[],
         ${rows.map(r => r.confidence)}::real[]
       ) as t(ts, state, confidence)
+      on conflict (device_id, ts) do nothing
+      returning id
     `;
 
-    return NextResponse.json({ ok: true, received: rows.length }, { status: 201 });
+    return NextResponse.json(
+      { ok: true, received: rows.length, inserted: inserted.length },
+      { status: 201 }
+    );
   } catch (e) {
     return badRequest(e);
   }
