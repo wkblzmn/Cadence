@@ -140,6 +140,10 @@ static bool camStart() {
     s->set_gain_ctrl(s, 1);                // AGC on, to spend that headroom
     s->set_ae_level(s, 2);                 // aim brighter; gain pays, not time
     s->set_brightness(s, 1);
+    s->set_contrast(s, 1);                 // gain flattens the image; lift it
+    s->set_sharpness(s, 1);
+    s->set_lenc(s, 1);                     // the corners fall off without it
+    s->set_raw_gma(s, 1);
   }
   return true;
 }
@@ -281,6 +285,28 @@ static void handleSet() {
     int v = server.arg("contrast").toInt();
     if (v < -2 || v > 2) { server.send(400, "text/plain", "contrast: -2..2"); return; }
     s->set_contrast(s, v);
+  }
+
+  if (server.hasArg("sharpness")) {
+    int v = server.arg("sharpness").toInt();
+    if (v < -2 || v > 2) { server.send(400, "text/plain", "sharpness: -2..2"); return; }
+    s->set_sharpness(s, v);
+  }
+
+  // Denoise cleans up the noise that high gain introduces — and takes fine
+  // detail with it. On a face that detail is the eye and mouth landmarks, so
+  // less is usually better here than the sensor's default.
+  if (server.hasArg("denoise")) {
+    int v = server.arg("denoise").toInt();
+    if (v < 0 || v > 8) { server.send(400, "text/plain", "denoise: 0..8"); return; }
+    s->set_denoise(s, v);
+  }
+
+  // Lens correction. This board's optics darken the corners noticeably, and
+  // uneven brightness across the frame is worse than uniform dimness for a
+  // model trying to find a face near an edge.
+  if (server.hasArg("lenc")) {
+    s->set_lenc(s, server.arg("lenc") != "0");
   }
 
   // Raising this lets AGC buy more brightness with gain. Costs noise, not fps.
