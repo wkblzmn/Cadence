@@ -46,7 +46,26 @@
 #define PIN_HREF   7
 #define PIN_PCLK  13
 
-WebServer server(80);
+// Two servers on purpose.
+//
+// WebServer handles one client at a time and a streaming handler never
+// returns while its viewer stays connected — so serving MJPEG from port 80
+// makes the board deaf to every other request, including its own status
+// page. A stale browser tab then locks everything out until a power cycle.
+// Espressif's own example splits the ports for exactly this reason.
+//
+// Port 80: control. Always answers.
+// Port 81: MJPEG, driven by its own task.
+WebServer  server(80);
+WiFiServer streamServer(81);
+
+// The single active viewer. A new connection displaces the old one rather
+// than being refused: the common case is moving from the laptop to the phone,
+// and being told "busy" by a tab you already closed is useless.
+WiFiClient streamClient;
+
+volatile uint32_t framesSent = 0;
+volatile uint32_t lastFrameMs = 0;
 
 // ═══════════════════════════════════════════════════ camera
 
@@ -118,10 +137,11 @@ static void handleRoot() {
     "<title>Cadence camera</title>"
     "<body style='font-family:system-ui;background:#0d0d0d;color:#eee;margin:0;padding:16px'>"
     "<h1 style='font-size:16px'>Cadence camera</h1>"
-    "<p style='color:#999;font-size:13px'>MJPEG at <code>/stream</code> &middot; "
-    "single frame at <code>/jpg</code></p>"
-    "<img src='/stream' style='max-width:100%;border-radius:8px'>"
-    "<p style='color:#666;font-size:12px'>http://" + ip + "/stream</p>"
+    "<p style='color:#999;font-size:13px'>Stream on port 81 &middot; "
+    "single frame at <code>/jpg</code> &middot; <a style='color:#3987e5' href='/status'>status</a></p>"
+    "<img src='http://" + ip + ":81/stream' style='max-width:100%;border-radius:8px'>"
+    "<p style='color:#666;font-size:12px'>http://" + ip + ":81/stream<br>"
+    "Only one viewer at a time — opening it somewhere else takes it over.</p>"
     "</body>";
   server.send(200, "text/html", body);
 }
@@ -136,38 +156,116 @@ static void handleJpg() {
   esp_camera_fb_return(fb);
 }
 
+// Live tuning without a reflash. The stream exists to feed a model, and the
+// right size for that is not the right size for looking at, so both need to
+// be adjustable while it runs.
+static void handleSet() {
+  sensor_t *s = esp_camera_sensor_get();
+  cors();
+  if (!s) { server.send(500, "text/plain", "no sensor"); return; }
+
+  if (server.hasArg("size")) {
+    String v = server.arg("size");
+    framesize_t fs = FRAMESIZE_VGA;
+    if      (v == "qqvga") fs = FRAMESIZE_QQVGA;   // 160x120
+    else if (v == "qvga")  fs = FRAMESIZE_QVGA;    // 320x240
+    else if (v == "cif")   fs = FRAMESIZE_CIF;     // 400x296
+    else if (v == "vga")   fs = FRAMESIZE_VGA;     // 640x480
+    else if (v == "svga")  fs = FRAMESIZE_SVGA;    // 800x600
+    else { server.send(400, "text/plain", "size: qqvga|qvga|cif|vga|svga"); return; }
+    s->set_framesize(s, fs);
+  }
+
+  if (server.hasArg("q")) {
+    int q = server.arg("q").toInt();
+    if (q < 4 || q > 63) { server.send(400, "text/plain", "q: 4-63, lower is better"); return; }
+    s->set_quality(s, q);
+  }
+
+  server.send(200, "text/plain", "ok");
+}
+
+static void handleStatus() {
+  sensor_t *s = esp_camera_sensor_get();
+  char buf[256];
+  snprintf(buf, sizeof(buf),
+           "{\"rssi\":%d,\"ip\":\"%s\",\"framesize\":%d,\"quality\":%d,"
+           "\"frames_sent\":%lu,\"viewer\":%s,\"uptime_s\":%lu}",
+           WiFi.RSSI(), WiFi.localIP().toString().c_str(),
+           s ? (int)s->status.framesize : -1,
+           s ? (int)s->status.quality : -1,
+           (unsigned long)framesSent,
+           (streamClient && streamClient.connected()) ? "true" : "false",
+           (unsigned long)(millis() / 1000));
+  cors();
+  server.send(200, "application/json", buf);
+}
+
+// ── the stream task ──────────────────────────────────────────────────────
+//
 // multipart/x-mixed-replace — the browser replaces the image in place for
 // every part, which is what makes an <img> behave like video.
-static void handleStream() {
-  WiFiClient client = server.client();
-  if (!client.connected()) return;
 
-  client.print(
-    "HTTP/1.1 200 OK\r\n"
-    "Access-Control-Allow-Origin: *\r\n"
-    "Cache-Control: no-store\r\n"
-    "Content-Type: multipart/x-mixed-replace; boundary=cadenceframe\r\n"
-    "\r\n");
+static void sendStreamHeader(WiFiClient &c) {
+  c.print("HTTP/1.1 200 OK\r\n"
+          "Access-Control-Allow-Origin: *\r\n"
+          "Cache-Control: no-store\r\n"
+          "Connection: close\r\n"
+          "Content-Type: multipart/x-mixed-replace; boundary=cadenceframe\r\n"
+          "\r\n");
+}
 
-  while (client.connected()) {
+static void streamTask(void *) {
+  streamServer.begin();
+  streamServer.setNoDelay(true);
+
+  for (;;) {
+    WiFiClient incoming = streamServer.available();
+    if (incoming) {
+      // Drain the request line and headers. Without this the request sits in
+      // the socket buffer and the first frame is appended to it.
+      uint32_t t0 = millis();
+      while (incoming.connected() && millis() - t0 < 1000) {
+        String line = incoming.readStringUntil('\n');
+        if (line.length() <= 1) break;          // blank line ends the headers
+      }
+
+      if (streamClient && streamClient.connected()) streamClient.stop();
+      streamClient = incoming;
+      streamClient.setNoDelay(true);
+      sendStreamHeader(streamClient);
+      Serial.println("[STREAM] viewer attached");
+    }
+
+    if (!streamClient || !streamClient.connected()) {
+      vTaskDelay(pdMS_TO_TICKS(20));
+      continue;
+    }
+
     camera_fb_t *fb = esp_camera_fb_get();
-    if (!fb) break;
+    if (!fb) { vTaskDelay(pdMS_TO_TICKS(20)); continue; }
 
-    client.printf("--cadenceframe\r\n"
-                  "Content-Type: image/jpeg\r\n"
-                  "Content-Length: %u\r\n\r\n",
-                  (unsigned)fb->len);
-    size_t sent = client.write(fb->buf, fb->len);
-    client.print("\r\n");
+    streamClient.printf("--cadenceframe\r\n"
+                        "Content-Type: image/jpeg\r\n"
+                        "Content-Length: %u\r\n\r\n",
+                        (unsigned)fb->len);
+    size_t sent = streamClient.write(fb->buf, fb->len);
+    streamClient.print("\r\n");
+
+    bool short_write = (sent != fb->len);
     esp_camera_fb_return(fb);
 
-    // A short write means the client went away mid-frame. Without this the
-    // loop keeps grabbing frames for a viewer that is no longer there.
-    if (sent != fb->len) break;
+    if (short_write) {
+      // The viewer went away mid-frame. Drop it rather than keep grabbing
+      // frames for a socket nobody is reading.
+      Serial.println("[STREAM] viewer left");
+      streamClient.stop();
+      continue;
+    }
 
-    // Yields to the Wi-Fi stack. Without a yield the watchdog eventually
-    // fires on a saturated link.
-    delay(1);
+    framesSent++;
+    lastFrameMs = millis();
+    vTaskDelay(1);      // yield to the Wi-Fi stack
   }
 }
 
@@ -213,12 +311,19 @@ void setup() {
 
   server.on("/", handleRoot);
   server.on("/jpg", handleJpg);
-  server.on("/stream", handleStream);
+  server.on("/status", handleStatus);
+  server.on("/set", handleSet);
   server.begin();
 
-  Serial.printf("Wi-Fi   : up, ip=%s rssi=%d\n",
-                WiFi.localIP().toString().c_str(), WiFi.RSSI());
-  Serial.printf("Stream  : http://%s/stream\n", WiFi.localIP().toString().c_str());
+  // Own task so a connected viewer can never block the control server.
+  xTaskCreatePinnedToCore(streamTask, "stream", 4096, nullptr, 1, nullptr, 1);
+
+  String ip = WiFi.localIP().toString();
+  Serial.printf("Wi-Fi   : up, ip=%s rssi=%d\n", ip.c_str(), WiFi.RSSI());
+  Serial.printf("Stream  : http://%s:81/stream\n", ip.c_str());
+  Serial.printf("Preview : http://%s/\n", ip.c_str());
+  Serial.printf("Status  : http://%s/status\n", ip.c_str());
+  Serial.printf("Tune    : http://%s/set?size=qvga&q=15\n", ip.c_str());
 }
 
 void loop() {
