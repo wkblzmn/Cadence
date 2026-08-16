@@ -135,9 +135,11 @@ static bool camStart() {
   // here: the model wants a current frame more than a clean one. Reversible
   // at runtime with /set?fast=0.
   if (s) {
-    s->set_aec2(s, 0);
-    s->set_gainceiling(s, GAINCEILING_16X);
-    s->set_gain_ctrl(s, 1);
+    s->set_aec2(s, 0);                     // no night-mode frame-rate drop
+    s->set_gainceiling(s, GAINCEILING_32X);
+    s->set_gain_ctrl(s, 1);                // AGC on, to spend that headroom
+    s->set_ae_level(s, 2);                 // aim brighter; gain pays, not time
+    s->set_brightness(s, 1);
   }
   return true;
 }
@@ -253,9 +255,50 @@ static void handleSet() {
   if (server.hasArg("fast")) {
     bool fast = server.arg("fast") != "0";
     s->set_aec2(s, fast ? 0 : 1);
-    s->set_gainceiling(s, fast ? GAINCEILING_16X : GAINCEILING_2X);
+    s->set_gainceiling(s, fast ? GAINCEILING_32X : GAINCEILING_2X);
     s->set_gain_ctrl(s, 1);        // leave AGC on to use that headroom
     s->set_exposure_ctrl(s, 1);
+  }
+
+  // Brightness without spending time. ae_level moves the auto-exposure
+  // *target*, and with night mode off and a high gain ceiling the sensor
+  // reaches that target using gain — so the picture brightens and the frame
+  // rate does not drop. This is the knob to reach for first when the image is
+  // dim; raising exposure directly is what made it slow in the first place.
+  if (server.hasArg("ae")) {
+    int v = server.arg("ae").toInt();
+    if (v < -2 || v > 2) { server.send(400, "text/plain", "ae: -2..2"); return; }
+    s->set_ae_level(s, v);
+  }
+
+  if (server.hasArg("bright")) {
+    int v = server.arg("bright").toInt();
+    if (v < -2 || v > 2) { server.send(400, "text/plain", "bright: -2..2"); return; }
+    s->set_brightness(s, v);
+  }
+
+  if (server.hasArg("contrast")) {
+    int v = server.arg("contrast").toInt();
+    if (v < -2 || v > 2) { server.send(400, "text/plain", "contrast: -2..2"); return; }
+    s->set_contrast(s, v);
+  }
+
+  // Raising this lets AGC buy more brightness with gain. Costs noise, not fps.
+  if (server.hasArg("gainceiling")) {
+    int v = server.arg("gainceiling").toInt();
+    gainceiling_t g;
+    switch (v) {
+      case 2:   g = GAINCEILING_2X;   break;
+      case 4:   g = GAINCEILING_4X;   break;
+      case 8:   g = GAINCEILING_8X;   break;
+      case 16:  g = GAINCEILING_16X;  break;
+      case 32:  g = GAINCEILING_32X;  break;
+      case 64:  g = GAINCEILING_64X;  break;
+      case 128: g = GAINCEILING_128X; break;
+      default: server.send(400, "text/plain", "gainceiling: 2|4|8|16|32|64|128"); return;
+    }
+    s->set_gainceiling(s, g);
+    s->set_gain_ctrl(s, 1);
   }
 
   server.send(200, "text/plain", "ok");
@@ -266,10 +309,15 @@ static void handleStatus() {
   char buf[256];
   snprintf(buf, sizeof(buf),
            "{\"rssi\":%d,\"ip\":\"%s\",\"framesize\":%d,\"quality\":%d,"
+           "\"ae_level\":%d,\"brightness\":%d,\"agc_gain\":%d,\"aec_value\":%d,"
            "\"frames_sent\":%lu,\"viewer\":%s,\"uptime_s\":%lu}",
            WiFi.RSSI(), WiFi.localIP().toString().c_str(),
            s ? (int)s->status.framesize : -1,
            s ? (int)s->status.quality : -1,
+           s ? (int)s->status.ae_level : 0,
+           s ? (int)s->status.brightness : 0,
+           s ? (int)s->status.agc_gain : 0,
+           s ? (int)s->status.aec_value : 0,
            (unsigned long)framesSent,
            (streamClient && streamClient.connected()) ? "true" : "false",
            (unsigned long)(millis() / 1000));
