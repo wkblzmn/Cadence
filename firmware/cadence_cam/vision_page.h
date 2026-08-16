@@ -48,6 +48,7 @@ static const char VISION_PAGE[] PROGMEM = R"HTMLPAGE(
     <div class="state absent" id="state">starting</div>
     <div class="row"><span class="k">yaw</span><span class="v" id="yaw">-</span></div>
     <div class="row"><span class="k">pitch</span><span class="v" id="pitch">-</span></div>
+    <div class="row"><span class="k">gaze</span><span class="v" id="gaze">-</span></div>
     <div class="row"><span class="k">eyes</span><span class="v" id="eyes">-</span></div>
     <div class="row"><span class="k">inference</span><span class="v" id="ms">-</span></div>
     <div class="row"><span class="k">samples sent</span><span class="v" id="sent">0</span></div>
@@ -62,8 +63,12 @@ static const char VISION_PAGE[] PROGMEM = R"HTMLPAGE(
 </div>
 
 <script type="module">
+// Pinned to a version that exists. 1.0.1 is current; an earlier draft of this
+// page pinned 0.10.14, which is not a published version at all — the import
+// 404s and the page dies before any of the code below runs, with nothing
+// useful on screen to say why. Check the CDN, do not assume the version.
 import { FaceLandmarker, FilesetResolver }
-  from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+  from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@1.0.1/vision_bundle.mjs";
 
 const $ = id => document.getElementById(id);
 const cv = $("cv"), ctx = cv.getContext("2d", { willReadFrequently: true });
@@ -74,18 +79,19 @@ const img = $("src");
 const P = new URLSearchParams(location.search);
 const YAW_LIMIT   = parseFloat(P.get("yaw")   ?? "0.20");  // fraction of eye span
 const PITCH_LIMIT = parseFloat(P.get("pitch") ?? "0.28");
+const GAZE_LIMIT  = parseFloat(P.get("gaze")  ?? "0.35");  // blendshape score
 const HZ          = parseFloat(P.get("hz")    ?? "4");     // inference rate
 const WINDOW_MS   = parseInt  (P.get("window")?? "2000");  // one sample per window
 
 // The stream is on port 81; this page is served from port 80 on the same host.
 img.src = `http://${location.hostname}:81/stream`;
 
-let landmarker = null, centre = null, sent = 0;
+let landmarker = null, centre = null, sent = 0, lastGaze = 0;
 const votes = [];
 
 try {
   const fileset = await FilesetResolver.forVisionTasks(
-    "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
+    "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@1.0.1/wasm");
   landmarker = await FaceLandmarker.createFromOptions(fileset, {
     baseOptions: {
       modelAssetPath:
@@ -123,28 +129,43 @@ function classify(res) {
   let { yaw, pitch } = pose(lm);
   if (centre) { yaw -= centre.yaw; pitch -= centre.pitch; }
 
-  // Blendshapes give actual eyelid closure, which landmark distance does not
-  // separate cleanly from simply looking down.
-  let closed = 0;
+  // Gaze, from the ARKit-standard blendshapes the model already returns.
+  //
+  // Head pose alone misses the case that matters most here: glancing at a
+  // phone on the desk moves the eyes far more than the head. These scores are
+  // an explicit eye-direction signal, which is a stronger reason to call
+  // someone distracted than a few degrees of head rotation.
+  let closed = 0, gaze = 0;
   const bs = res.faceBlendshapes?.[0]?.categories;
   if (bs) {
     const g = n => bs.find(c => c.categoryName === n)?.score ?? 0;
     closed = Math.max(g("eyeBlinkLeft"), g("eyeBlinkRight"));
+    gaze = Math.max(
+      g("eyeLookOutLeft"),  g("eyeLookOutRight"),
+      g("eyeLookInLeft"),   g("eyeLookInRight"),
+      g("eyeLookDownLeft"), g("eyeLookDownRight"));
   }
+  lastGaze = gaze;
+  const gazeRel = centre ? Math.max(0, gaze - centre.gaze) : gaze;
 
-  const off = Math.abs(yaw) > YAW_LIMIT || Math.abs(pitch) > PITCH_LIMIT;
-  // Eyes shut is not distraction — a blink is 100-400 ms and the window vote
-  // absorbs it. Only sustained closure would matter, and that is a different
-  // signal (drowsiness) this project does not claim to detect.
-  const state = off ? "distracted" : "focused";
+  const headOff = Math.abs(yaw) > YAW_LIMIT || Math.abs(pitch) > PITCH_LIMIT;
+  const eyesOff = gazeRel > GAZE_LIMIT;
+
+  // Eyes shut is not distraction. A blink is 100-400 ms and the window vote
+  // absorbs it; sustained closure is drowsiness, a different signal this
+  // project does not claim to detect. So closure is reported, never scored.
+  const state = (headOff || eyesOff) ? "distracted" : "focused";
   const conf = Math.min(1, Math.max(0.5,
-    1 - Math.max(Math.abs(yaw) / YAW_LIMIT, Math.abs(pitch) / PITCH_LIMIT) * 0.3));
-  return { state, conf, yaw, pitch, eyes: closed };
+    1 - Math.max(Math.abs(yaw) / YAW_LIMIT,
+                 Math.abs(pitch) / PITCH_LIMIT,
+                 gazeRel / GAZE_LIMIT) * 0.3));
+  return { state, conf, yaw, pitch, eyes: closed, gaze: gazeRel };
 }
 
 $("cal").onclick = () => {
   if (!lastLm) return;
   centre = pose(lastLm);
+  centre.gaze = lastGaze;
   $("err").textContent = "Centre calibrated.";
 };
 
@@ -169,6 +190,7 @@ function tick() {
   $("state").className = "state " + r.state;
   $("yaw").textContent   = r.yaw   === null ? "-" : r.yaw.toFixed(3);
   $("pitch").textContent = r.pitch === null ? "-" : r.pitch.toFixed(3);
+  $("gaze").textContent  = r.gaze  === undefined || r.gaze === null ? "-" : r.gaze.toFixed(2);
   $("eyes").textContent  = r.eyes  === null ? "-" : r.eyes.toFixed(2);
   $("ms").textContent    = dt.toFixed(0) + " ms";
 
