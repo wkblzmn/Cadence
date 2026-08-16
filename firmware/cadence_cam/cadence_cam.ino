@@ -23,7 +23,10 @@
 #include <WiFi.h>
 #include <WebServer.h>
 #include <ESPmDNS.h>
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
 #include "secrets.h"
+#include "vision_page.h"
 
 // ═══════════════════════════════════════════════════ pins (07_bringup_camera)
 
@@ -427,6 +430,59 @@ static void handleSet() {
   server.send(200, "text/plain", "ok");
 }
 
+// ── vision page and the focus relay ──────────────────────────────────────
+
+static void handleVision() {
+  cors();
+  server.send_P(200, "text/html", VISION_PAGE);
+}
+
+// The browser posts the exact body /api/ingest/focus expects; this attaches
+// the bearer token and forwards it verbatim. No JSON parsing here on purpose
+// — the backend already validates every field, and duplicating those rules in
+// firmware would give two places to disagree.
+//
+// The point of the relay is that the token stays in firmware. A page served
+// to the LAN cannot hold it, and this is the smallest thing that keeps it out
+// of one. The trade is that anything on the LAN can post focus samples
+// through this board — acceptable for a device whose dashboard is already
+// public, and worth revisiting if that ever changes.
+static void handleFocus() {
+  cors();
+  if (server.method() == HTTP_OPTIONS) {
+    server.sendHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+    server.sendHeader("Access-Control-Allow-Headers", "Content-Type");
+    server.send(204);
+    return;
+  }
+
+  String body = server.arg("plain");
+  if (body.length() == 0 || body.length() > 4096) {
+    server.send(400, "text/plain", "empty or oversized body");
+    return;
+  }
+
+  String url = String(API_BASE) + "/api/ingest/focus";
+  HTTPClient http;
+  if (!httpBegin(http, url)) {
+    server.send(502, "text/plain", "could not open upstream");
+    return;
+  }
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("Authorization", "Bearer " API_TOKEN);
+
+  int status = http.POST(body);
+  String reply = status > 0 ? http.getString() : String("upstream unreachable");
+  http.end();
+
+  if (status <= 0) {
+    Serial.printf("[FOCUS] upstream failed: %d\n", status);
+    server.send(502, "text/plain", reply);
+    return;
+  }
+  server.send(status, "application/json", reply);
+}
+
 static void handleStatus() {
   sensor_t *s = esp_camera_sensor_get();
   char buf[256];
@@ -575,6 +631,9 @@ void setup() {
   server.on("/jpg", handleJpg);
   server.on("/status", handleStatus);
   server.on("/set", handleSet);
+  server.on("/vision", handleVision);
+  server.on("/focus", HTTP_POST, handleFocus);
+  server.on("/focus", HTTP_OPTIONS, handleFocus);
   server.begin();
 
   // Own task so a connected viewer can never block the control server.
@@ -586,6 +645,7 @@ void setup() {
   Serial.printf("Preview : http://%s/\n", ip.c_str());
   Serial.printf("Status  : http://%s/status\n", ip.c_str());
   Serial.printf("Tune    : http://%s/set?size=qvga&q=15\n", ip.c_str());
+  Serial.printf("Vision  : http://%s/vision\n", ip.c_str());
 }
 
 void loop() {

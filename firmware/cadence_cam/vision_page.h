@@ -1,0 +1,213 @@
+// ─────────────────────────────────────────────────────────────────────────
+//  The vision page, served from this board at GET /vision.
+//
+//  Why it lives here rather than on the dashboard: the stream is HTTP on the
+//  LAN and the deployed dashboard is HTTPS, and browsers refuse that mix. A
+//  page served from this board is same-scheme with the stream, and an HTTP
+//  page may still call an HTTPS API — only the reverse is blocked.
+//
+//  The browser does the inference. MediaPipe's face landmarker runs in WASM,
+//  reads frames from the MJPEG stream on port 81, decides focused/distracted/
+//  absent, and posts batches back to POST /focus on this board, which attaches
+//  the API token and forwards them. The token never reaches the page.
+// ─────────────────────────────────────────────────────────────────────────
+
+#pragma once
+
+static const char VISION_PAGE[] PROGMEM = R"HTMLPAGE(
+<!doctype html>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Cadence vision</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin:0; padding:16px; background:#0d0d0d; color:#ededed;
+         font-family:system-ui,-apple-system,"Segoe UI",sans-serif; }
+  h1 { font-size:15px; margin:0 0 12px; font-weight:600; }
+  .wrap { display:flex; flex-wrap:wrap; gap:16px; align-items:flex-start; }
+  canvas { max-width:100%; border-radius:8px; background:#000; }
+  .panel { min-width:220px; }
+  .state { font-size:34px; font-weight:600; margin:4px 0 2px; }
+  .focused { color:#0ca30c; } .distracted { color:#fab219; } .absent { color:#898781; }
+  .row { display:flex; justify-content:space-between; gap:12px;
+         border-bottom:1px solid rgba(255,255,255,.1); padding:5px 0; font-size:13px; }
+  .k { color:#898781; } .v { font-variant-numeric:tabular-nums; }
+  .note { color:#898781; font-size:12px; margin-top:10px; line-height:1.5; }
+  button { background:#3987e5; color:#fff; border:0; border-radius:6px;
+           padding:7px 12px; font-size:13px; cursor:pointer; margin-top:10px; }
+  img { display:none; }
+</style>
+
+<h1>Cadence vision</h1>
+<div class="wrap">
+  <div>
+    <canvas id="cv" width="640" height="480"></canvas>
+    <img id="src" crossorigin="anonymous">
+  </div>
+  <div class="panel">
+    <div class="k" style="font-size:12px">Current state</div>
+    <div class="state absent" id="state">starting</div>
+    <div class="row"><span class="k">yaw</span><span class="v" id="yaw">-</span></div>
+    <div class="row"><span class="k">pitch</span><span class="v" id="pitch">-</span></div>
+    <div class="row"><span class="k">eyes</span><span class="v" id="eyes">-</span></div>
+    <div class="row"><span class="k">inference</span><span class="v" id="ms">-</span></div>
+    <div class="row"><span class="k">samples sent</span><span class="v" id="sent">0</span></div>
+    <div class="row"><span class="k">last post</span><span class="v" id="post">-</span></div>
+    <button id="cal">Calibrate centre</button>
+    <p class="note">
+      Look straight at your screen and press calibrate. Everything is measured
+      relative to that, so the camera does not need to be centred.
+    </p>
+    <p class="note" id="err"></p>
+  </div>
+</div>
+
+<script type="module">
+import { FaceLandmarker, FilesetResolver }
+  from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+
+const $ = id => document.getElementById(id);
+const cv = $("cv"), ctx = cv.getContext("2d", { willReadFrequently: true });
+const img = $("src");
+
+// Tunables, overridable from the query string so calibration does not need an
+// edit-and-reflash cycle: /vision?yaw=0.22&hz=4&window=2000
+const P = new URLSearchParams(location.search);
+const YAW_LIMIT   = parseFloat(P.get("yaw")   ?? "0.20");  // fraction of eye span
+const PITCH_LIMIT = parseFloat(P.get("pitch") ?? "0.28");
+const HZ          = parseFloat(P.get("hz")    ?? "4");     // inference rate
+const WINDOW_MS   = parseInt  (P.get("window")?? "2000");  // one sample per window
+
+// The stream is on port 81; this page is served from port 80 on the same host.
+img.src = `http://${location.hostname}:81/stream`;
+
+let landmarker = null, centre = null, sent = 0;
+const votes = [];
+
+try {
+  const fileset = await FilesetResolver.forVisionTasks(
+    "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
+  landmarker = await FaceLandmarker.createFromOptions(fileset, {
+    baseOptions: {
+      modelAssetPath:
+        "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task",
+      delegate: "GPU",
+    },
+    outputFaceBlendshapes: true,
+    runningMode: "IMAGE",
+    numFaces: 1,
+  });
+} catch (e) {
+  $("err").textContent = "Model failed to load: " + e.message +
+    " — this page needs internet access for the MediaPipe model.";
+}
+
+// Head pose from landmark geometry rather than the transformation matrix.
+// The matrix's axis convention varies between versions; the ratio of the
+// nose's offset to the eye span does not, and it is scale-invariant, so it
+// does not care how far away you sit.
+function pose(lm) {
+  const L = lm[33], R = lm[263], nose = lm[1], brow = lm[168], chin = lm[152];
+  const span = Math.hypot(R.x - L.x, R.y - L.y) || 1e-6;
+  const midX = (L.x + R.x) / 2, midY = (L.y + R.y) / 2;
+  return {
+    yaw:   (nose.x - midX) / span,
+    pitch: (nose.y - midY) / span - (chin.y - brow.y) / span * 0.25,
+  };
+}
+
+function classify(res) {
+  if (!res || !res.faceLandmarks || res.faceLandmarks.length === 0) {
+    return { state: "absent", conf: 0.9, yaw: null, pitch: null, eyes: null };
+  }
+  const lm = res.faceLandmarks[0];
+  let { yaw, pitch } = pose(lm);
+  if (centre) { yaw -= centre.yaw; pitch -= centre.pitch; }
+
+  // Blendshapes give actual eyelid closure, which landmark distance does not
+  // separate cleanly from simply looking down.
+  let closed = 0;
+  const bs = res.faceBlendshapes?.[0]?.categories;
+  if (bs) {
+    const g = n => bs.find(c => c.categoryName === n)?.score ?? 0;
+    closed = Math.max(g("eyeBlinkLeft"), g("eyeBlinkRight"));
+  }
+
+  const off = Math.abs(yaw) > YAW_LIMIT || Math.abs(pitch) > PITCH_LIMIT;
+  // Eyes shut is not distraction — a blink is 100-400 ms and the window vote
+  // absorbs it. Only sustained closure would matter, and that is a different
+  // signal (drowsiness) this project does not claim to detect.
+  const state = off ? "distracted" : "focused";
+  const conf = Math.min(1, Math.max(0.5,
+    1 - Math.max(Math.abs(yaw) / YAW_LIMIT, Math.abs(pitch) / PITCH_LIMIT) * 0.3));
+  return { state, conf, yaw, pitch, eyes: closed };
+}
+
+$("cal").onclick = () => {
+  if (!lastLm) return;
+  centre = pose(lastLm);
+  $("err").textContent = "Centre calibrated.";
+};
+
+let lastLm = null;
+
+function tick() {
+  if (!landmarker || !img.naturalWidth) return;
+  cv.width = img.naturalWidth; cv.height = img.naturalHeight;
+  ctx.drawImage(img, 0, 0);
+
+  let res;
+  const t0 = performance.now();
+  try { res = landmarker.detect(cv); }
+  catch (e) { $("err").textContent = "detect: " + e.message; return; }
+  const dt = performance.now() - t0;
+
+  const r = classify(res);
+  lastLm = res?.faceLandmarks?.[0] ?? null;
+  votes.push(r.state);
+
+  $("state").textContent = r.state;
+  $("state").className = "state " + r.state;
+  $("yaw").textContent   = r.yaw   === null ? "-" : r.yaw.toFixed(3);
+  $("pitch").textContent = r.pitch === null ? "-" : r.pitch.toFixed(3);
+  $("eyes").textContent  = r.eyes  === null ? "-" : r.eyes.toFixed(2);
+  $("ms").textContent    = dt.toFixed(0) + " ms";
+
+  if (lastLm) {
+    ctx.fillStyle = r.state === "focused" ? "#0ca30c" : "#fab219";
+    for (const i of [33, 263, 1, 168, 152]) {
+      ctx.beginPath();
+      ctx.arc(lastLm[i].x * cv.width, lastLm[i].y * cv.height, 3, 0, 7);
+      ctx.fill();
+    }
+  }
+}
+
+// One sample per window, decided by majority vote over the frames in it. A
+// single frame should never decide a focus state: a blink or a glance is not
+// distraction, and the vote is what makes those transients disappear.
+async function flush() {
+  if (votes.length === 0) return;
+  const tally = {};
+  for (const v of votes) tally[v] = (tally[v] ?? 0) + 1;
+  const state = Object.keys(tally).reduce((a, b) => tally[a] >= tally[b] ? a : b);
+  const conf = tally[state] / votes.length;
+  votes.length = 0;
+
+  const body = { samples: [{ ts: new Date().toISOString(), state, confidence: conf }] };
+  try {
+    const r = await fetch("/focus", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    $("post").textContent = r.ok ? "ok" : "HTTP " + r.status;
+    if (r.ok) $("sent").textContent = ++sent;
+  } catch (e) {
+    $("post").textContent = "failed";
+  }
+}
+
+setInterval(tick, Math.max(60, 1000 / HZ));
+setInterval(flush, WINDOW_MS);
+</script>
+)HTMLPAGE";
