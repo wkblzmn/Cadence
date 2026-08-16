@@ -330,11 +330,66 @@ static void handleSet() {
     s->set_lenc(s, server.arg("lenc") != "0");
   }
 
-  // Gamma on the raw data. Exposed because it had to be: with no live control
-  // it was the one setting that could not be ruled out while debugging a
-  // black image, and it turned out to be the cause.
+  // Gamma on the raw data.
   if (server.hasArg("gma")) {
     s->set_raw_gma(s, server.arg("gma") != "0");
+  }
+
+  // Manual exposure and gain.
+  //
+  // These are the controls that matter in a dim room, and the reason nothing
+  // worked earlier: aec_value and agc_gain are MANUAL-mode registers. They do
+  // nothing while exposure_ctrl and gain_ctrl are left on auto, which is how
+  // they sat at 490 and 2 through every change — not stale readings, just
+  // registers that were never enabled.
+  //
+  // exposure: 0-1200, higher is longer (and slower). auto to hand it back.
+  // gain:     0-30,   higher is brighter and noisier. auto to hand it back.
+  if (server.hasArg("exposure")) {
+    String v = server.arg("exposure");
+    if (v == "auto") {
+      s->set_exposure_ctrl(s, 1);
+    } else {
+      int e = v.toInt();
+      if (e < 0 || e > 1200) { server.send(400, "text/plain", "exposure: 0-1200 or auto"); return; }
+      s->set_exposure_ctrl(s, 0);
+      s->set_aec_value(s, e);
+    }
+  }
+
+  if (server.hasArg("gain")) {
+    String v = server.arg("gain");
+    if (v == "auto") {
+      s->set_gain_ctrl(s, 1);
+    } else {
+      int g = v.toInt();
+      if (g < 0 || g > 30) { server.send(400, "text/plain", "gain: 0-30 or auto"); return; }
+      s->set_gain_ctrl(s, 0);
+      s->set_agc_gain(s, g);
+    }
+  }
+
+  // A documented low-light configuration for this sensor family, applied as
+  // one unit. Manual exposure and manual gain, both high — it trades the
+  // ability to adapt to changing light for actually being able to see in a
+  // dim room, which is the right way round for a desk that does not change.
+  if (server.hasArg("night")) {
+    bool on = server.arg("night") != "0";
+    if (on) {
+      s->set_gainceiling(s, GAINCEILING_128X);
+      s->set_exposure_ctrl(s, 0);
+      s->set_aec_value(s, 700);
+      s->set_gain_ctrl(s, 0);
+      s->set_agc_gain(s, 20);
+      s->set_ae_level(s, 2);
+      s->set_brightness(s, 2);
+    } else {
+      s->set_exposure_ctrl(s, 1);
+      s->set_gain_ctrl(s, 1);
+      s->set_gainceiling(s, GAINCEILING_2X);
+      s->set_ae_level(s, 0);
+      s->set_brightness(s, 0);
+    }
   }
 
   // Raising this lets AGC buy more brightness with gain. Costs noise, not fps.
