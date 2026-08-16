@@ -26,6 +26,8 @@
 #include <LovyanGFX.hpp>
 #include <Wire.h>
 #include <Adafruit_BME280.h>
+#include <Adafruit_BMP280.h>
+#include <DHTesp.h>
 #include <BH1750.h>
 #include <soc/gpio_reg.h>
 #include <WiFi.h>
@@ -51,6 +53,11 @@
 #define PIN_ENC_DT    5
 #define PIN_ENC_SW    6
 #define PIN_BTN       7
+
+// DHT22 data line. Not I2C — a single-wire protocol, so it needs its own pin.
+// 18 is from the free list in docs/WIRING.md: not strapping, not USB, not
+// flash/PSRAM. Change this one define if you wire it elsewhere.
+#define PIN_DHT      18
 
 #define ADDR_BME    0x76      // hard-coded per spec §3. Change if 0x77.
 #define ADDR_BH1750 0x23      // confirmed by bring-up 01.
@@ -123,10 +130,33 @@ LGFX_Sprite canvas(&tft);
 
 // ═══════════════════════════════════════════════════ sensors
 
+// Two possible environment sensors on the same address. The GYBMEP silkscreen
+// reads "BME/BMP280" for both parts and they are visually identical, so which
+// one is fitted is not knowable until the chip ID is read at boot:
+//   0x60 -> BME280, temperature + pressure + humidity
+//   0x58 -> BMP280, temperature + pressure only, no humidity sensor on the die
+// The BME280 library refuses anything that is not 0x60, so a BMP280 needs its
+// own driver rather than a flag. Detect and adapt instead of assuming.
 Adafruit_BME280 bme;
+Adafruit_BMP280 bmp(&Wire);
+DHTesp dht;
 BH1750 lightMeter(ADDR_BH1750);
 
-bool  bmeOk   = false;
+// Which parts are actually fitted. A BME280 alone covers all three readings;
+// a BMP280 plus a DHT22 covers the same ground with two cheaper parts, since
+// the DHT22 supplies exactly the humidity the BMP280 lacks.
+bool srcBme = false;    // BME280 — temperature, humidity, pressure
+bool srcBmp = false;    // BMP280 — temperature, pressure
+bool srcDht = false;    // DHT22  — temperature, humidity
+
+// Derived from the above, so the render and post paths never have to know
+// which combination of parts produced a value.
+bool hasTemp     = false;
+bool hasHumidity = false;
+bool hasPressure = false;
+
+const char *envName = "absent";
+
 bool  luxOk   = false;
 
 float tempC   = NAN;
@@ -169,13 +199,49 @@ static void readSensors() {
     }
   }
 
-  if (bmeOk && now - lastSlow > 2000) {
+  // I2C only. The DHT22 is read on core 0 by netTask — see readDht().
+  if ((srcBme || srcBmp) && now - lastSlow > 2000) {
     lastSlow = now;
-    tempC     = bme.readTemperature();
-    humidity  = bme.readHumidity();
-    pressHpa  = bme.readPressure() / 100.0f;
-    realFeelC = heatIndexC(tempC, humidity);
+    if (srcBme) {
+      tempC     = bme.readTemperature();
+      humidity  = bme.readHumidity();
+      pressHpa  = bme.readPressure() / 100.0f;
+      realFeelC = heatIndexC(tempC, humidity);
+    } else {
+      pressHpa = bmp.readPressure() / 100.0f;
+      // When a DHT22 is present its temperature is the one paired with the
+      // humidity going into the heat index, so it owns tempC and this reading
+      // is skipped. Two sensors disagreeing by half a degree would otherwise
+      // make the real-feel figure quietly inconsistent with the temperature
+      // shown beside it.
+      if (!srcDht) tempC = bmp.readTemperature();
+    }
   }
+}
+
+// Called from netTask on core 0, never from loop(). DHTesp takes a critical
+// section for the ~5 ms bit-banged read, and portENTER_CRITICAL on ESP32 masks
+// interrupts on the calling core only. The encoder ISR is registered on core 1
+// (attachInterrupt runs from setup, which lives on the Arduino task), so
+// reading here cannot cost it an edge — and this decoder is the half-detent
+// kind with no spare edge to lose.
+static void readDht() {
+  if (!srcDht) return;
+
+  static uint32_t last = 0;
+  // A DHT22 tops out at 0.5 Hz and the library enforces ~2 s itself; asking
+  // more often just returns the cached sample.
+  if (millis() - last < 2500) return;
+  last = millis();
+
+  TempAndHumidity v = dht.getTempAndHumidity();
+  if (dht.getStatus() != DHTesp::ERROR_NONE || isnan(v.humidity)) return;
+
+  // A failed read keeps the previous values rather than blanking the row. One
+  // dropped sample on a bit-banged protocol is normal and not worth showing.
+  humidity  = v.humidity;
+  tempC     = v.temperature;
+  realFeelC = heatIndexC(tempC, humidity);
 }
 
 // Auto-dim (spec §2). The screen lights the room it is measuring, so the
@@ -603,11 +669,11 @@ static void postReading() {
   // Nulls where the BME280 is absent. §7 allows it and the dashboard shows a
   // gap, which is the honest representation of a missing sensor.
   String body = String("{\"device_id\":\"") + DEVICE_ID + "\",\"ts\":\"" + ts + "\",";
-  appendJsonFloat(body, "temp_c",       tempC,     bmeOk); body += ',';
-  appendJsonFloat(body, "humidity",     humidity,  bmeOk); body += ',';
-  appendJsonFloat(body, "pressure_hpa", pressHpa,  bmeOk); body += ',';
-  appendJsonFloat(body, "lux",          lux,       luxOk); body += ',';
-  appendJsonFloat(body, "real_feel_c",  realFeelC, bmeOk);
+  appendJsonFloat(body, "temp_c",       tempC,     hasTemp);     body += ',';
+  appendJsonFloat(body, "humidity",     humidity,  hasHumidity); body += ',';
+  appendJsonFloat(body, "pressure_hpa", pressHpa,  hasPressure); body += ',';
+  appendJsonFloat(body, "lux",          lux,       luxOk);       body += ',';
+  appendJsonFloat(body, "real_feel_c",  realFeelC, hasHumidity);
   body += "}";
 
   httpPostJson("/api/ingest/readings", body);
@@ -773,6 +839,7 @@ static void netTask(void *) {
   for (;;) {
     netService();
     ntpService();
+    readDht();          // core 0 on purpose — see readDht()
 
     if (netState == NET_UP && timeValid) {
       uint32_t now = millis();
@@ -1016,20 +1083,25 @@ static void pageHome() {
   canvas.setFont(&fonts::Font2);
 
   canvas.setTextDatum(middle_left);
-  canvas.setTextColor(bmeOk ? C_TEXT : C_DIM, C_BG);
-  if (bmeOk) snprintf(buf, sizeof(buf), "%.1f C", tempC);
-  else       snprintf(buf, sizeof(buf), "-- C");
+  canvas.setTextColor(hasTemp ? C_TEXT : C_DIM, C_BG);
+  if (hasTemp) snprintf(buf, sizeof(buf), "%.1f C", tempC);
+  else         snprintf(buf, sizeof(buf), "-- C");
   canvas.drawString(buf, 12, 66);
 
+  // Humidity when anything can supply it; pressure is the fallback so the
+  // middle cell is never permanently blank on a pressure-only build.
   canvas.setTextDatum(middle_center);
-  if (bmeOk) snprintf(buf, sizeof(buf), "%.0f %%", humidity);
-  else       snprintf(buf, sizeof(buf), "-- %%");
+  canvas.setTextColor(hasHumidity || hasPressure ? C_TEXT : C_DIM, C_BG);
+  if (hasHumidity)      snprintf(buf, sizeof(buf), "%.0f %%", humidity);
+  else if (hasPressure) snprintf(buf, sizeof(buf), "%.0f hPa", pressHpa);
+  else                  snprintf(buf, sizeof(buf), "-- %%");
   canvas.drawString(buf, SCREEN_W / 2, 66);
 
   canvas.setTextDatum(middle_right);
-  canvas.setTextColor(bmeOk ? C_ACCENT : C_DIM, C_BG);
-  if (bmeOk) snprintf(buf, sizeof(buf), "feels %.1f C", realFeelC);
-  else       snprintf(buf, sizeof(buf), "feels --");
+  canvas.setTextColor(hasHumidity ? C_ACCENT : C_DIM, C_BG);
+  if (hasHumidity)      snprintf(buf, sizeof(buf), "feels %.1f C", realFeelC);
+  else if (hasPressure) snprintf(buf, sizeof(buf), "no humidity");
+  else                  snprintf(buf, sizeof(buf), "feels --");
   canvas.drawString(buf, SCREEN_W - 12, 66);
 
   // ── middle band, 296 x 92 ──────────────────────────────────────────────
@@ -1184,7 +1256,9 @@ static void pageStatus() {
     statusRow(70, "NTP", "waiting for sync", C_WARN);
   }
 
-  statusRow(96, "BME280", bmeOk ? "ok" : "absent", bmeOk ? C_GOOD : C_WARN);
+  // Names the parts actually fitted, not the one the spec asked for.
+  statusRow(96, "Env sensor", envName,
+            hasHumidity ? C_GOOD : hasTemp ? C_WARN : C_WARN);
 
   if (luxOk) snprintf(buf, sizeof(buf), "ok  %.0f lx", lux);
   else       snprintf(buf, sizeof(buf), "absent");
@@ -1217,6 +1291,12 @@ static void pageStatus() {
   statusRow(174, "Session", buf,
             timerState == T_RUNNING ? C_GOOD
           : timerState == T_PAUSED  ? C_WARN : C_DIM);
+
+  // Pressure has no cell on Home once humidity takes the middle slot, so it
+  // lives here rather than nowhere.
+  if (hasPressure) snprintf(buf, sizeof(buf), "%.0f hPa", pressHpa);
+  else             snprintf(buf, sizeof(buf), "--");
+  statusRow(200, "Pressure", buf, hasPressure ? C_TEXT : C_DIM);
 }
 
 // ─────────────────────────────────────────── frame
@@ -1302,15 +1382,54 @@ void setup() {
 
   Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL, 100000);
 
-  bmeOk = bme.begin(ADDR_BME, &Wire);
-  Serial.printf("BME280  : %s\n", bmeOk ? "ok" : "ABSENT - env page shows --");
-  if (bmeOk) {
+  // BME280 first, because it is the part the design wants. Its library reads
+  // the chip ID and refuses anything that is not 0x60, so this returns false
+  // for a BMP280 rather than half-working — which is why the fallback needs a
+  // different driver instead of a flag.
+  if (bme.begin(ADDR_BME, &Wire)) {
+    srcBme = true;
     bme.setSampling(Adafruit_BME280::MODE_FORCED,
                     Adafruit_BME280::SAMPLING_X1,
                     Adafruit_BME280::SAMPLING_X1,
                     Adafruit_BME280::SAMPLING_X1,
                     Adafruit_BME280::FILTER_OFF);
+  } else if (bmp.begin(ADDR_BME, BMP280_CHIPID)) {
+    // The library defaults to 0x77; this module is strapped to 0x76.
+    srcBmp = true;
+    // Normal mode rather than forced: forced needs takeForcedMeasurement()
+    // before every read, and readSensors() polls on its own 2 s timer.
+    bmp.setSampling(Adafruit_BMP280::MODE_NORMAL,
+                    Adafruit_BMP280::SAMPLING_X1,
+                    Adafruit_BMP280::SAMPLING_X1,
+                    Adafruit_BMP280::FILTER_OFF,
+                    Adafruit_BMP280::STANDBY_MS_500);
   }
+
+  // A DHT22 supplies exactly what a BMP280 lacks, so it is only probed when
+  // humidity is actually missing. A BME280 build pays nothing for this —
+  // including the settling delay, which is the expensive part.
+  if (!srcBme) {
+    dht.setup(PIN_DHT, DHTesp::DHT22);
+    delay(1200);                       // DHT22 needs ~1 s after power-up
+    TempAndHumidity probe = dht.getTempAndHumidity();
+    srcDht = (dht.getStatus() == DHTesp::ERROR_NONE) && !isnan(probe.humidity);
+  }
+
+  hasTemp     = srcBme || srcBmp || srcDht;
+  hasHumidity = srcBme || srcDht;
+  hasPressure = srcBme || srcBmp;
+
+  envName = srcBme            ? "BME280"
+          : (srcBmp && srcDht) ? "BMP280 + DHT22"
+          : srcBmp             ? "BMP280 - no humidity"
+          : srcDht             ? "DHT22 - no pressure"
+                               : "absent";
+
+  Serial.printf("Env     : %s  (temp %s, humidity %s, pressure %s)\n",
+                envName,
+                hasTemp     ? "yes" : "no",
+                hasHumidity ? "yes" : "no",
+                hasPressure ? "yes" : "no");
 
   luxOk = lightMeter.begin(BH1750::CONTINUOUS_HIGH_RES_MODE, ADDR_BH1750, &Wire);
   Serial.printf("BH1750  : %s\n", luxOk ? "ok" : "ABSENT");
