@@ -145,11 +145,25 @@ static bool camStart() {
   // here: the model wants a current frame more than a clean one. Reversible
   // at runtime with /set?fast=0.
   if (s) {
-    s->set_aec2(s, 0);                     // no night-mode frame-rate drop
-    s->set_gainceiling(s, GAINCEILING_32X);
-    s->set_gain_ctrl(s, 1);                // AGC on, to spend that headroom
-    s->set_ae_level(s, 2);                 // aim brighter; gain pays, not time
-    s->set_brightness(s, 1);
+    // Low-light configuration, on by default, because a dim desk in the
+    // evening is the case this device exists for. Verified on hardware: at
+    // ~30 lux the auto loops give a black frame, and this gives a clearly
+    // landmarkable face.
+    //
+    // The reason auto could never get there: aec_value and agc_gain are
+    // manual-mode registers, ignored entirely while exposure_ctrl and
+    // gain_ctrl are on auto. Raising ceilings and targets did nothing because
+    // the sensor's own loop was overriding all of it.
+    //
+    // The trade is that manual exposure does not adapt, so a bright room will
+    // blow this out. /set?night=0 hands both loops back to auto.
+    s->set_gainceiling(s, GAINCEILING_128X);
+    s->set_exposure_ctrl(s, 0);
+    s->set_aec_value(s, 700);
+    s->set_gain_ctrl(s, 0);
+    s->set_agc_gain(s, 20);
+    s->set_ae_level(s, 2);
+    s->set_brightness(s, 2);
     s->set_raw_gma(s, 1);                  // measured on hardware: clearly better
   }
 
