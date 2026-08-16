@@ -150,19 +150,22 @@ static bool camStart() {
     s->set_gain_ctrl(s, 1);                // AGC on, to spend that headroom
     s->set_ae_level(s, 2);                 // aim brighter; gain pays, not time
     s->set_brightness(s, 1);
+    s->set_raw_gma(s, 1);                  // measured on hardware: clearly better
   }
 
-  // Deliberately NOT setting contrast, sharpness, lenc or raw_gma here.
+  // Deliberately NOT setting contrast, sharpness or lenc.
   //
-  // Those four went in together and the image went black. raw_gma is the one
-  // that could not be ruled out from a browser, because it was the only tweak
-  // with no live control — so every attempt to neutralise the settings left
-  // it stuck at my value, and it survived power cycles too. Gamma applied
-  // wrongly crushes everything to black no matter what the exposure does.
+  // Those three went in alongside raw_gma and the image went black. raw_gma
+  // has since been shown on hardware to be the good one of the four — turning
+  // it on visibly improves the picture — so the cause is among the remaining
+  // three, most likely lenc: lens correction applies a per-module calibration
+  // table, and the wrong table darkens the whole frame.
   //
-  // The rule this earns: do not set anything at init that cannot also be
+  // Two rules earned here. Do not set anything at init that cannot also be
   // changed at runtime, or the first thing you cannot rule out is your own
-  // default. All four are available through /set for anyone who wants them.
+  // default, invisible precisely because it is in every configuration. And do
+  // not change four things at once, or you learn only that one of them was
+  // wrong. All three remain available through /set.
   return true;
 }
 
