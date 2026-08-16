@@ -69,8 +69,18 @@ volatile uint32_t lastFrameMs = 0;
 
 // ═══════════════════════════════════════════════════ camera
 
-static bool cameraBegin() {
-  camera_config_t cfg = {};
+// The live config is kept so the camera can be torn down and brought back up
+// at a different frame size. esp_camera_init() allocates the frame buffers
+// from this, which is exactly why a resolution change cannot be a simple
+// set_framesize() call — see camRestart().
+camera_config_t camCfg = {};
+
+// Held around every use of a frame buffer. A reconfigure frees the buffers a
+// streaming frame may still be writing into, so the two must never overlap.
+SemaphoreHandle_t camLock = nullptr;
+
+static void camConfigure(framesize_t fs) {
+  camera_config_t &cfg = camCfg;
   cfg.pin_pwdn     = PIN_PWDN;
   cfg.pin_reset    = PIN_RESET;
   cfg.pin_xclk     = PIN_XCLK;
@@ -90,7 +100,7 @@ static bool cameraBegin() {
   // more pixels, and every extra pixel is bandwidth on a shared Wi-Fi link
   // and decode time on the phone.
   cfg.pixel_format = PIXFORMAT_JPEG;
-  cfg.frame_size   = FRAMESIZE_VGA;
+  cfg.frame_size   = fs;
   cfg.jpeg_quality = 12;
   cfg.fb_count     = 2;
   cfg.fb_location  = CAMERA_FB_IN_PSRAM;
@@ -98,8 +108,10 @@ static bool cameraBegin() {
   // rather than watch an ever-growing lag. Gaze data that is three seconds
   // late is worse than no data.
   cfg.grab_mode    = CAMERA_GRAB_LATEST;
+}
 
-  esp_err_t err = esp_camera_init(&cfg);
+static bool camStart() {
+  esp_err_t err = esp_camera_init(&camCfg);
   if (err != ESP_OK) {
     Serial.printf("FATAL: camera init failed (0x%04x %s)\n", err, esp_err_to_name(err));
     return false;
@@ -128,6 +140,26 @@ static bool cameraBegin() {
     s->set_gain_ctrl(s, 1);
   }
   return true;
+}
+
+// A resolution change has to be a full teardown, not set_framesize().
+//
+// esp_camera_init() allocates the frame buffers for the size in the config.
+// set_framesize() changes what the sensor emits but never touches those
+// buffers, so going UP writes past the end of them — that is a heap overflow,
+// and it wedged this board once already. Going down "fits" but produced zero
+// frames in testing, because the DMA descriptors still describe the old
+// geometry. Neither direction is safe.
+//
+// So: stop the world, free everything, allocate for the new size.
+static bool camRestart(framesize_t fs) {
+  xSemaphoreTake(camLock, portMAX_DELAY);
+  esp_camera_deinit();
+  camConfigure(fs);
+  bool ok = camStart();
+  xSemaphoreGive(camLock);
+  Serial.printf("[CAM] reconfigured to framesize %d: %s\n", (int)fs, ok ? "ok" : "FAILED");
+  return ok;
 }
 
 // ═══════════════════════════════════════════════════ http
@@ -159,13 +191,19 @@ static void handleRoot() {
 }
 
 static void handleJpg() {
+  xSemaphoreTake(camLock, portMAX_DELAY);
   camera_fb_t *fb = esp_camera_fb_get();
-  if (!fb) { server.send(503, "text/plain", "capture failed"); return; }
+  if (!fb) {
+    xSemaphoreGive(camLock);
+    server.send(503, "text/plain", "capture failed");
+    return;
+  }
   cors();
   server.setContentLength(fb->len);
   server.send(200, "image/jpeg", "");
   server.client().write(fb->buf, fb->len);
   esp_camera_fb_return(fb);
+  xSemaphoreGive(camLock);
 }
 
 // Live tuning without a reflash. The stream exists to feed a model, and the
@@ -178,14 +216,22 @@ static void handleSet() {
 
   if (server.hasArg("size")) {
     String v = server.arg("size");
-    framesize_t fs = FRAMESIZE_VGA;
+    framesize_t fs;
     if      (v == "qqvga") fs = FRAMESIZE_QQVGA;   // 160x120
     else if (v == "qvga")  fs = FRAMESIZE_QVGA;    // 320x240
     else if (v == "cif")   fs = FRAMESIZE_CIF;     // 400x296
     else if (v == "vga")   fs = FRAMESIZE_VGA;     // 640x480
     else if (v == "svga")  fs = FRAMESIZE_SVGA;    // 800x600
-    else { server.send(400, "text/plain", "size: qqvga|qvga|cif|vga|svga"); return; }
-    s->set_framesize(s, fs);
+    else if (v == "xga")   fs = FRAMESIZE_XGA;     // 1024x768
+    else { server.send(400, "text/plain", "size: qqvga|qvga|cif|vga|svga|xga"); return; }
+
+    // Full restart, not set_framesize — the buffers must be reallocated.
+    if (!camRestart(fs)) {
+      server.send(500, "text/plain", "camera failed to restart at that size");
+      return;
+    }
+    s = esp_camera_sensor_get();     // the old handle is gone after deinit
+    if (!s) { server.send(500, "text/plain", "no sensor after restart"); return; }
   }
 
   if (server.hasArg("q")) {
@@ -272,8 +318,15 @@ static void streamTask(void *) {
       continue;
     }
 
+    // Lock spans the whole frame: the buffer stays owned by the driver until
+    // it is returned, and a reconfigure in that window would free it mid-write.
+    xSemaphoreTake(camLock, portMAX_DELAY);
     camera_fb_t *fb = esp_camera_fb_get();
-    if (!fb) { vTaskDelay(pdMS_TO_TICKS(20)); continue; }
+    if (!fb) {
+      xSemaphoreGive(camLock);
+      vTaskDelay(pdMS_TO_TICKS(20));
+      continue;
+    }
 
     streamClient.printf("--cadenceframe\r\n"
                         "Content-Type: image/jpeg\r\n"
@@ -284,6 +337,7 @@ static void streamTask(void *) {
 
     bool short_write = (sent != fb->len);
     esp_camera_fb_return(fb);
+    xSemaphoreGive(camLock);
 
     if (short_write) {
       // The viewer went away mid-frame. Drop it rather than keep grabbing
@@ -310,7 +364,14 @@ void setup() {
     Serial.println("FATAL: no PSRAM. N16R8 needs the OPI PSRAM board setting.");
     while (true) delay(1000);
   }
-  if (!cameraBegin()) {
+  camLock = xSemaphoreCreateMutex();
+  if (!camLock) {
+    Serial.println("FATAL: could not create the camera mutex.");
+    while (true) delay(1000);
+  }
+
+  camConfigure(FRAMESIZE_VGA);
+  if (!camStart()) {
     while (true) delay(1000);
   }
 
