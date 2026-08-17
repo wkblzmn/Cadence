@@ -4,20 +4,26 @@
 //  Canvas : 320 x 240 landscape
 //
 //  In scope : display, pages, encoder nav, buttons, timer state machine,
-//             BH1750 auto-dim, BME280 environment, character face,
-//             Wi-Fi, NTP, durable event queue, backend ingest, and the
-//             todo list pulled from the dashboard.
-//  Not yet  : ESP-NOW satellite, camera.
+//             BH1750 auto-dim, environment sensing, Wi-Fi, NTP, durable event
+//             queue, backend ingest, the todo list and the week's focus totals
+//             pulled from the dashboard, and arming the camera board's vision
+//             page from the focus-timer button.
+//  Not yet  : ESP-NOW satellite.
+//  Removed  : the character face, in the 2026-08-17 Home redesign.
 //
 //  Threading: rendering and input run in loop() on core 1. All networking
 //  runs in netTask on core 0, because HTTPClient blocks and a 2 s TLS
 //  handshake in loop() would freeze the UI and drop encoder detents. The
-//  event queue is shared across both and guarded by a mutex.
+//  event queue, the todo list and the stats block are each shared across both
+//  and each guarded by its own mutex.
 //
 //  Libraries (Library Manager):
 //    LovyanGFX               by lovyan03
 //    Adafruit BME280 Library by Adafruit  (pulls Adafruit_Sensor, BusIO)
 //    BH1750                  by Christopher Laws
+//    DHT sensor library for ESPx           (DHTesp, for the DHT22)
+//    U8g2                    by olikraus  (font tables only — LovyanGFX
+//                                          renders them via lgfx::U8g2font)
 //
 //  Credentials live in secrets.h, in this folder, kept out of git.
 // ─────────────────────────────────────────────────────────────────────────
@@ -34,7 +40,26 @@
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
 #include <time.h>
+// Included for its font tables only — LovyanGFX does all the rendering. Each
+// font lives in its own linker section, so --gc-sections (on by default in the
+// ESP32 core) drops the ~2000 faces this sketch never names. If the binary
+// ever jumps by hundreds of KB, that is the setting to check first.
+#include <U8g2lib.h>
 #include "secrets.h"
+
+// Where the camera board lives. Defaulted here rather than required in
+// secrets.h so an existing secrets.h from before the vision tier still
+// compiles — override it there if the name does not resolve.
+//
+// The name is what the camera already advertises over mDNS (CAM_HOSTNAME in
+// its own secrets.h), so this survives a DHCP lease change that a hard-coded
+// IP would not. The caveat is the demo network: mDNS is unreliable on some
+// phone hotspots, which is exactly what docs/WIRING.md tells you to use. If
+// the pill on Home reads NO CAM while the board is plainly up, put its IP
+// here and reflash — the same tradeoff API_BASE already carries.
+#ifndef CAM_HOST
+#define CAM_HOST "cadence-cam.local"
+#endif
 
 // ═══════════════════════════════════════════════════ pins (spec §3, S3 map)
 
@@ -118,6 +143,29 @@ public:
 LGFX tft;
 LGFX_Sprite canvas(&tft);
 
+// ── type scale ───────────────────────────────────────────────────────────
+//
+// Bitmap faces from U8g2, rendered by LovyanGFX through lgfx::U8g2font.
+// Font7 and Font2 are gone from Home: a seven-segment clock and an 8px
+// blocky bitmap are most of why the screen read as a debug readout.
+//
+// The _tf suffix is the full Latin-1 range, which carries a real degree sign,
+// so temperatures are typeset rather than faked with a drawn ring.
+//
+// The clock is _tr (all of ASCII) and not the much smaller _tn digit subset:
+// _tn is 724 bytes against 4625, but whether it carries a colon is not
+// something the datasheet-free font table will tell you, and a clock with no
+// colon is not worth 4 KB of a 3 MB partition.
+//
+// Nothing here is proportional-safe for a clock — see drawClock(), which
+// places digits in fixed cells so the time does not jitter as 1 swaps for 8.
+static const lgfx::U8g2font fontClock(u8g2_font_logisoso42_tr);
+static const lgfx::U8g2font fontTimer(u8g2_font_helvB24_tf);
+static const lgfx::U8g2font fontValue(u8g2_font_helvB14_tf);
+static const lgfx::U8g2font fontBody (u8g2_font_helvR14_tf);
+static const lgfx::U8g2font fontLabel(u8g2_font_helvR10_tf);
+static const lgfx::U8g2font fontTiny (u8g2_font_helvR08_tf);
+
 // Palette. Warm-neutral, readable at low brightness.
 #define C_BG      0x0861      // near-black
 #define C_PANEL   0x18E3      // card
@@ -126,7 +174,12 @@ LGFX_Sprite canvas(&tft);
 #define C_ACCENT  0x05DF      // cyan
 #define C_WARN    0xFC00      // amber
 #define C_GOOD    0x2E6B      // green
-#define C_FACE    0x05DF
+
+// Hairline, between C_BG and C_PANEL. Structure without weight — the old page
+// had no rules at all, which is why five readings read as five fragments.
+#define C_RULE    0x2124
+// Chart track and the unfilled part of the attention bar.
+#define C_TRACK   0x10A2
 
 // ═══════════════════════════════════════════════════ sensors
 
@@ -822,17 +875,231 @@ static void refreshTodos() {
   Serial.printf("[TODO] %d task%s from the dashboard\n", n, n == 1 ? "" : "s");
 }
 
+// ── week and attention stats (spec §8) ───────────────────────────────────
+//
+// §4 forbids the firmware accumulating totals, and this does not: every number
+// is computed by session_daily() and focus_daily() in Postgres and only drawn
+// here. The Status page's old comment said today's figure belonged on-device
+// "once it can fetch it" — httpGetBody exists now, so it can.
+//
+// One endpoint serves both the chart and the attention bar, because the TLS
+// handshake is the expensive part of asking. /api/stats/hub is shaped to be
+// read by a scanner rather than a parser: `days` is a flat array of 7 integers
+// and every other field is an integer too, so there are no floats, no
+// booleans and no nested objects to walk.
+
+#define STATS_DAYS 7
+
+static SemaphoreHandle_t statsLock = nullptr;
+#define STATS_TAKE() xSemaphoreTake(statsLock, portMAX_DELAY)
+#define STATS_GIVE() xSemaphoreGive(statsLock)
+
+// Guarded by statsLock: written on netTask (core 0), read by the renderer.
+long statDays[STATS_DAYS] = {0};
+long statPeak = 0, statToday = 0;
+bool statHasAttn = false;
+long statFocused = 0, statDistracted = 0, statAway = 0;
+int  statRatio = 0;
+bool statsFetched = false;
+
+// Finds "key": and returns the position just past the colon.
+//
+// Scanning, not parsing — the same trade the todo reader makes, and safe for
+// the same reason: this walks a document this project also writes, so every
+// key is known. It would not be safe over arbitrary user text.
+static const char *jsonFind(const char *body, const char *key) {
+  char pat[40];
+  snprintf(pat, sizeof(pat), "\"%s\"", key);
+  const char *p = strstr(body, pat);
+  if (!p) return nullptr;
+  p = strchr(p + strlen(pat), ':');
+  return p ? p + 1 : nullptr;
+}
+
+// Returns false on a miss rather than yielding 0. A missing field and a real
+// zero have to stay distinguishable: a failed fetch that quietly produced
+// zeros would draw an empty chart, which looks exactly like a week with no
+// work in it and is the same class of lie as the 201 on a discarded reading.
+static bool jsonReadLong(const char *body, const char *key, long *out) {
+  const char *p = jsonFind(body, key);
+  if (!p) return false;
+  while (*p == ' ') p++;
+  char *end = nullptr;
+  long v = strtol(p, &end, 10);
+  if (end == p) return false;
+  *out = v;
+  return true;
+}
+
+static int jsonReadLongArray(const char *body, const char *key, long *out, int n) {
+  const char *p = jsonFind(body, key);
+  if (!p) return 0;
+  while (*p == ' ') p++;
+  if (*p != '[') return 0;
+  p++;
+
+  int i = 0;
+  while (i < n) {
+    while (*p == ' ' || *p == ',') p++;
+    if (*p == ']' || *p == '\0') break;
+    char *end = nullptr;
+    long v = strtol(p, &end, 10);
+    if (end == p) break;                 // not a number — stop, do not spin
+    out[i++] = v;
+    p = end;
+  }
+  return i;
+}
+
+static void refreshStats() {
+  String body;
+  int status = httpGetBody("/api/stats/hub", body);
+  if (status != 200) {
+    Serial.printf("[STATS] GET failed: %d\n", status);
+    return;                              // keep whatever is already on screen
+  }
+
+  const char *b = body.c_str();
+
+  long days[STATS_DAYS] = {0};
+  int n = jsonReadLongArray(b, "days", days, STATS_DAYS);
+  if (n != STATS_DAYS) {
+    // A short array would shift every column by a day instead of failing
+    // visibly, so it is refused outright rather than partially accepted.
+    Serial.printf("[STATS] wanted %d days, got %d - keeping previous\n",
+                  STATS_DAYS, n);
+    return;
+  }
+
+  long today = 0, peak = 0, attn = 0, foc = 0, dis = 0, away = 0, ratio = 0;
+  jsonReadLong(b, "today_seconds", &today);
+  jsonReadLong(b, "peak_seconds",  &peak);
+  jsonReadLong(b, "data",          &attn);
+  jsonReadLong(b, "focused",       &foc);
+  jsonReadLong(b, "distracted",    &dis);
+  jsonReadLong(b, "away",          &away);
+  jsonReadLong(b, "ratio",         &ratio);
+
+  STATS_TAKE();
+  memcpy(statDays, days, sizeof(statDays));
+  statToday      = today;
+  statPeak       = peak;
+  statHasAttn    = (attn == 1);
+  statFocused    = foc;
+  statDistracted = dis;
+  statAway       = away;
+  statRatio      = (int)ratio;
+  statsFetched   = true;
+  STATS_GIVE();
+
+  Serial.printf("[STATS] peak %lds today %lds attention %s %d%%\n",
+                peak, today, statHasAttn ? "yes" : "none", (int)ratio);
+}
+
+// ── the camera board (spec §8, vision tier) ──────────────────────────────
+//
+// The focus-timer button starts the vision page's recording. It has to,
+// because the alternative is a page that samples whenever a tab happens to be
+// open — which is how a tab left open overnight becomes an unbroken four-hour
+// focus that never happened.
+//
+// The hub cannot address a browser tab, so it does not try. It tells the
+// camera board, the board holds the state, and the page polls the board. Each
+// hop is between two things that can actually name each other.
+//
+// Plain HTTP, not TLS: this is one board talking to another on the same LAN,
+// and a handshake per heartbeat would cost more than the exchange it guards.
+//
+// The heartbeat runs whatever the state, not only while a session is running.
+// It is what keeps the board's TTL from expiring a live session, it refreshes
+// the pill on Home, and it means a single dropped "idle" cannot leave the
+// camera recording — the next beat corrects it either way.
+
+#define CAM_HEARTBEAT_MS 30000UL   // camera expires the session at 3x this
+
+static volatile uint8_t camWantState = 0;   // 0 idle · 1 running · 2 paused
+static volatile bool    camDirty     = false;
+
+bool     camOnline     = false;
+bool     camViewer     = false;    // something is pulling the stream
+uint32_t camLastOk     = 0;
+int      camLastStatus = 0;
+
+static const char *camStateName(uint8_t s) {
+  return s == 1 ? "running" : s == 2 ? "paused" : "idle";
+}
+
+// Called from loop() on core 1. Records the intent and returns immediately —
+// the request itself happens on netTask, for the same reason every other
+// request does.
+static void camNotify(uint8_t state) {
+  camWantState = state;
+  camDirty     = true;
+}
+
+// `announce` is set when this push carries an actual state change rather than
+// being a heartbeat, so the monitor shows button presses and reachability
+// flips without a line every 30 seconds burying everything else.
+static void camPushSession(bool announce) {
+  String url = String("http://") + CAM_HOST + "/session?state="
+             + camStateName(camWantState);
+
+  HTTPClient http;
+  if (!httpBegin(http, url)) { camOnline = false; camViewer = false; return; }
+
+  // Tighter than httpBegin's defaults, which are sized for a TLS handshake to
+  // Vercel. This is a LAN GET to a device that either answers in milliseconds
+  // or is switched off, and a camera that is off must not hold up the todo
+  // fetch queued behind it on this task.
+  http.setConnectTimeout(1500);
+  http.setTimeout(2000);
+
+  int status = http.GET();
+  String resp = status > 0 ? http.getString() : String();
+  http.end();
+
+  bool wasOnline = camOnline;
+  camLastStatus  = status;
+  camOnline      = (status >= 200 && status < 300);
+
+  if (camOnline) {
+    camLastOk = millis();
+    // Scanned, not parsed. One boolean out of a response this project also
+    // writes does not justify a parser; the hand-rolled one used for todos
+    // exists only because todo titles are arbitrary user text.
+    camViewer = resp.indexOf("\"viewer\":true") >= 0;
+  } else {
+    camViewer = false;
+  }
+
+  // "Armed the camera" and "shouted into the void" have to look different in
+  // the monitor. Every silent-success defect this project has hit — the 201
+  // on a discarded reading, the status line that read healthy while every
+  // request failed — was something that reported fine while losing data.
+  if (announce || wasOnline != camOnline) {
+    Serial.printf("[CAM] %s -> %s (%d)%s\n",
+                  camStateName(camWantState),
+                  camOnline ? "ok" : "unreachable",
+                  camLastStatus,
+                  (camOnline && !camViewer) ? "  no viewer - is /vision open?" : "");
+  }
+}
+
 // ── the network task ─────────────────────────────────────────────────────
 
 #define READING_INTERVAL_MS 60000UL
 #define API_RETRY_MS         5000UL
 #define TODO_INTERVAL_MS    60000UL
 #define TODO_FIRST_TRY_MS    5000UL
+#define STATS_INTERVAL_MS   60000UL
+#define STATS_FIRST_TRY_MS   7000UL
 
 static void netTask(void *) {
   uint32_t lastReading = 0;
   uint32_t lastAttempt = 0;
   uint32_t lastTodo    = 0;
+  uint32_t lastStats   = 0;
+  uint32_t lastCamPush = 0;
 
   netBegin();          // first attempt immediately; retries are handled below
 
@@ -840,6 +1107,24 @@ static void netTask(void *) {
     netService();
     ntpService();
     readDht();          // core 0 on purpose — see readDht()
+
+    // Deliberately outside the timeValid gate below. Arming the camera needs
+    // neither NTP nor the backend: a session started before the clock lands
+    // should still start the tracking. The event it queued gets its real UTC
+    // timestamp when NTP arrives, but the recording has to begin now.
+    if (netState == NET_UP) {
+      uint32_t now = millis();
+      if (camDirty || now - lastCamPush >= CAM_HEARTBEAT_MS) {
+        // A push that fails takes the flag with it, so a state change lost to
+        // a camera that was briefly off is not retried immediately — the next
+        // heartbeat carries the current state anyway, which is the whole
+        // reason the heartbeat runs when idle as well as when running.
+        bool announce = camDirty;
+        camDirty      = false;
+        lastCamPush   = now;
+        camPushSession(announce);
+      }
+    }
 
     if (netState == NET_UP && timeValid) {
       uint32_t now = millis();
@@ -861,6 +1146,14 @@ static void netTask(void *) {
       if (now - lastTodo >= (todosFetched ? TODO_INTERVAL_MS : TODO_FIRST_TRY_MS)) {
         lastTodo = now;
         refreshTodos();
+      }
+
+      // Offset from the todo fetch rather than sharing its timer, so the two
+      // TLS handshakes do not land in the same 250 ms tick — netTask also has
+      // the DHT read and the camera heartbeat to get through.
+      if (now - lastStats >= (statsFetched ? STATS_INTERVAL_MS : STATS_FIRST_TRY_MS)) {
+        lastStats = now;
+        refreshStats();
       }
     }
 
@@ -890,6 +1183,13 @@ static uint32_t sessionElapsedMs() {
 // Never blocks, never invents a timestamp.
 static void emitSessionEvent(const char *type) {
   evqPush(type);
+
+  // The camera board mirrors the timer, so the vision page records only while
+  // a session is actually running. Taken from timerState rather than from the
+  // event name: they are the same fact, and every caller below sets the state
+  // and then emits. Two switches over one fact is how they drift apart.
+  camNotify(timerState == T_RUNNING ? 1 : timerState == T_PAUSED ? 2 : 0);
+
   Serial.printf("[EVENT] queued type=%s uptime_ms=%lu\n",
                 type, (unsigned long)millis());
 }
@@ -930,29 +1230,39 @@ static void timerLongPress() {
 // at should not require turning a knob to see the temperature.
 enum Page : uint8_t { PAGE_HOME, PAGE_TASKS, PAGE_STATUS, PAGE_COUNT };
 uint8_t page = PAGE_HOME;
-const char *pageName[PAGE_COUNT] = { "HOME", "TASKS", "STATUS & SESSION" };
+const char *pageName[PAGE_COUNT] = { "home", "tasks", "status & session" };
 
 // ─────────────────────────────────────────── chrome
 
 static void drawStatusBar() {
   canvas.fillRect(0, 0, SCREEN_W, 22, C_PANEL);
-  canvas.setFont(&fonts::Font2);
+  canvas.drawFastHLine(0, 22, SCREEN_W, C_RULE);
+
+  // Lower case, matching Home. Small caps in a 10px bitmap face lose the
+  // ascender and descender shapes that make a word readable at a glance.
+  canvas.setFont(&fontLabel);
   canvas.setTextDatum(middle_left);
   canvas.setTextColor(C_TEXT, C_PANEL);
-  canvas.drawString(pageName[page], 8, 11);
+  canvas.drawString(pageName[page], 10, 11);
 
   canvas.setTextDatum(middle_right);
   canvas.setTextColor(timerState == T_RUNNING ? C_GOOD
                     : timerState == T_PAUSED  ? C_WARN : C_DIM, C_PANEL);
-  canvas.drawString(timerState == T_RUNNING ? "FOCUS"
-                  : timerState == T_PAUSED  ? "PAUSED" : "IDLE", SCREEN_W - 8, 11);
+  canvas.drawString(timerState == T_RUNNING ? "focus"
+                  : timerState == T_PAUSED  ? "paused" : "idle", SCREEN_W - 10, 11);
 }
 
+// Moved to the very bottom edge. Home's bottom row now occupies y 220..236,
+// where these used to sit at 230 — and losing them was not an option, since
+// they are the only thing on the screen saying the knob turns.
+//
+// fillSmoothCircle rather than fillCircle: at r=2 an aliased circle is a
+// square with the corners bitten off.
 static void drawPageDots() {
   int cx = SCREEN_W / 2 - (PAGE_COUNT * 12) / 2 + 6;
   for (int i = 0; i < PAGE_COUNT; i++) {
-    if (i == page) canvas.fillCircle(cx + i * 12, SCREEN_H - 10, 3, C_ACCENT);
-    else           canvas.fillCircle(cx + i * 12, SCREEN_H - 10, 2, C_DIM);
+    if (i == page) canvas.fillSmoothCircle(cx + i * 12, SCREEN_H - 3, 2, C_ACCENT);
+    else           canvas.fillSmoothCircle(cx + i * 12, SCREEN_H - 3, 1, C_DIM);
   }
 }
 
@@ -965,186 +1275,422 @@ static void fmtHMS(uint32_t ms, char *out, size_t n) {
            (unsigned long)(s % 60));
 }
 
-// Character face, re-sized for the 296x92 band on Home instead of a full
-// screen. Blink on a timer; expression follows the timer state.
+// The character face is gone, deliberately. It was a Phase 2 deliverable and
+// removing it is a reversal, not an oversight — on hardware it sat small in a
+// 296px band with ~85px of dead black either side of it, and it was the
+// smallest thing on a screen it was supposed to anchor. The space it held now
+// carries the week chart, which is information rather than decoration.
 //
-// Measured against the band (y 82..174): eyes sit at cy-14 with r16, so they
-// span 98..130; the smile bottoms out at cy+26+10 plus its 3px pen, so 167.
-// Both clear the band with room, which is what keeps the face from colliding
-// with the environment row above or the bottom bar below.
-static void drawFace(int cx, int cy) {
-  static uint32_t nextBlink = 3000;
-  static uint32_t blinkEnd  = 0;
-  uint32_t now = millis();
+// The degree sign below is emitted as UTF-8 ("\xC2\xB0", U+00B0). LovyanGFX
+// decodes UTF-8 by default and the _tf fonts carry the full Latin-1 range, so
+// this is real type — the earlier plan to fake it with a drawn ring was only
+// needed while the fonts stopped at ASCII.
 
-  if (now > nextBlink) { blinkEnd = now + 130; nextBlink = now + random(2600, 5200); }
-  bool blinking = now < blinkEnd;
-
-  const int eyeDx = 46, eyeR = 16;
-  const int ey = cy - 14;
-
-  uint16_t col = timerState == T_RUNNING ? C_GOOD
-               : timerState == T_PAUSED  ? C_WARN : C_FACE;
-
-  if (blinking) {
-    canvas.fillRoundRect(cx - eyeDx - eyeR, ey - 3, eyeR * 2, 6, 3, col);
-    canvas.fillRoundRect(cx + eyeDx - eyeR, ey - 3, eyeR * 2, 6, 3, col);
-  } else if (timerState == T_RUNNING) {
-    // Narrowed — concentrating.
-    canvas.fillRoundRect(cx - eyeDx - eyeR, ey - 8, eyeR * 2, 16, 6, col);
-    canvas.fillRoundRect(cx + eyeDx - eyeR, ey - 8, eyeR * 2, 16, 6, col);
-  } else {
-    canvas.fillCircle(cx - eyeDx, ey, eyeR, col);
-    canvas.fillCircle(cx + eyeDx, ey, eyeR, col);
-  }
-
-  int my = cy + 26;
-  if (timerState == T_RUNNING) {
-    canvas.fillRoundRect(cx - 26, my - 3, 52, 6, 3, col);          // flat, focused
-  } else if (timerState == T_PAUSED) {
-    canvas.fillRoundRect(cx - 20, my - 3, 40, 6, 3, col);
-  } else {
-    for (int i = -30; i <= 30; i++)                                 // gentle smile
-      canvas.fillCircle(cx + i, my + (int)(10 - i * i / 90.0f), 3, col);
-  }
+// Compact duration for chart labels. A column is ~36px, so "1h 20m" does not
+// fit and the space is what goes.
+static void fmtShort(long seconds, char *out, size_t n) {
+  long m = (seconds + 30) / 60;                  // to the nearest minute
+  if (m < 60) { snprintf(out, n, "%ldm", m); return; }
+  long h = m / 60, r = m % 60;
+  if (r) snprintf(out, n, "%ldh%02ld", h, r);
+  else   snprintf(out, n, "%ldh", h);
 }
 
-// Page 01 — Home. Everything ambient on one screen, so the common case needs
-// no navigation at all.
+// The clock, drawn digit by digit into fixed-width cells.
 //
-// Vertical budget for the 240px panel:
-//   0..51    top strip   clock left, labelled timer right
-//   52..79   environment row
-//   82..174  face band, 296 x 92
-//   ~200     bottom bar  tasks remaining left, vision pill right
-//   230      page dots
-static void pageHome() {
-  char buf[40];
+// logisoso is a proportional face: '1' is far narrower than '8'. Drawn as one
+// string the whole time shifts sideways every minute and the colon wanders,
+// which on a clock you stare at all day is the difference between a product
+// and a prototype. Measuring the widest digit once and centring each glyph in
+// a cell of that width costs one loop.
+//
+// Returns the x just past the last glyph so the am/pm suffix can be placed
+// from the real extent rather than a guessed offset.
+static int drawClock(const char *s, int x, int y, uint16_t col) {
+  canvas.setFont(&fontClock);
+  canvas.setTextColor(col, C_BG);
 
-  // ── top strip ──────────────────────────────────────────────────────────
-  // 12-hour with an AM/PM suffix. The earlier note called 24-hour mandatory
-  // rather than a preference, but that was measured against a layout carrying
-  // a weather box and a Font7 timer: 126 clock + 24 suffix + 126 timer +
-  // weather came to 324px on a 320px panel. The weather box is cut and the
-  // timer dropped to Font4, so the row now measures ~10 + 126 + 6 + 18 on the
-  // left against a timer starting near 198 — it fits with room to spare.
-  //
-  // Seconds are still dropped: HH:MM:SS in Font7 runs ~200px and would leave
-  // nothing for the timer. They tick on the Status page instead.
-  //
-  // Font7 is a seven-segment face with no letters in it, so the suffix is
-  // drawn separately in Font2 and placed from the measured clock width rather
-  // than a hardcoded offset — the hour is one or two digits wide.
-  bool isPM = false;
+  int cell = 0;
+  for (char d = '0'; d <= '9'; d++) {
+    char one[2] = { d, '\0' };
+    int w = canvas.textWidth(one);
+    if (w > cell) cell = w;
+  }
+
+  canvas.setTextDatum(middle_center);
+  int cx = x;
+  for (const char *p = s; *p; p++) {
+    char one[2] = { *p, '\0' };
+    if (*p == ':' || *p == '-') {
+      // Punctuation keeps its natural width. Padded to a digit cell it leaves
+      // a visible hole on both sides.
+      int w = canvas.textWidth(one);
+      canvas.drawString(one, cx + w / 2, y);
+      cx += w;
+    } else {
+      canvas.drawString(one, cx + cell / 2, y);
+      cx += cell;
+    }
+  }
+  return cx;
+}
+
+// True when today has attention data worth a strip. Peeked separately from
+// drawAttentionBar because the chart needs to know its own height before
+// anything is drawn — on a day with no vision data the strip is not shown
+// dimmed, it is not shown at all, and the chart takes the space.
+static bool hasAttentionToday() {
+  bool have; long total;
+  STATS_TAKE();
+  have  = statHasAttn;
+  total = statFocused + statDistracted + statAway;
+  STATS_GIVE();
+  return have && total > 0;
+}
+
+// Seven-day focus chart, the same shape as the dashboard's and deliberately
+// so: both derive from session_daily() and they should agree at a glance.
+//
+// Only the peak and today carry a value label. Seven labels across 282px
+// collide, and the dashboard's chart made the same call for the same reason.
+static void drawWeekChart(int x, int y, int w, int h) {
+  long days[STATS_DAYS], peak;
+  bool have;
+  STATS_TAKE();
+  memcpy(days, statDays, sizeof(days));
+  peak = statPeak;
+  have = statsFetched;
+  STATS_GIVE();
+
+  canvas.setFont(&fontTiny);
+
+  if (!have) {
+    // Never an empty chart on a failed fetch: a week of zero bars and a week
+    // that has not loaded look identical, and only one of them is true.
+    canvas.setTextDatum(middle_center);
+    canvas.setTextColor(C_DIM, C_BG);
+    canvas.drawString("waiting for the backend", x + w / 2, y + h / 2);
+    return;
+  }
+
+  // Round the scale up past the peak so the tallest bar never reaches the
+  // gridline and its label always has somewhere to sit.
+  static const long steps[] = { 900, 1800, 3600, 5400, 7200, 10800, 14400, 21600 };
+  long yMax = steps[0];
+  for (size_t i = 0; i < sizeof(steps) / sizeof(steps[0]); i++) {
+    yMax = steps[i];
+    if (peak < steps[i]) break;
+  }
+  if (peak >= steps[sizeof(steps) / sizeof(steps[0]) - 1]) {
+    yMax = ((peak / 3600) + 1) * 3600;
+  }
+
+  const int gut    = 24;
+  const int plotX  = x + gut;
+  const int plotW  = w - gut;
+  const int top    = y + 10;                      // room for value labels
+  const int base   = y + h - 11;                  // room for day initials
+  const int plotH  = base - top;
+  if (plotH < 8 || plotW < 40) return;
+
+  char buf[12];
+
+  canvas.setTextDatum(middle_right);
+  canvas.setTextColor(C_DIM, C_BG);
+  fmtShort(yMax, buf, sizeof(buf));
+  canvas.drawString(buf, plotX - 4, top);
+  canvas.drawString("0", plotX - 4, base);
+
+  canvas.drawFastHLine(plotX, top,  plotW, C_TRACK);
+  canvas.drawFastHLine(plotX, base, plotW, C_RULE);
+
+  int peakIdx = -1;
+  for (int i = 0; i < STATS_DAYS; i++) {
+    if (peak > 0 && days[i] == peak) { peakIdx = i; break; }
+  }
+
+  // Weekday initials ending on today. Derived from tm_wday rather than
+  // counted forward from a stored date, so it cannot drift.
+  int wdayToday = -1;
   if (timeValid) {
     time_t now = time(nullptr);
     struct tm lt;
     localtime_r(&now, &lt);
+    wdayToday = lt.tm_wday;
+  }
+  static const char *initials = "smtwtfs";
+
+  const int cellW = plotW / STATS_DAYS;
+  int barW = cellW - 14;
+  if (barW < 6) barW = 6;
+
+  for (int i = 0; i < STATS_DAYS; i++) {
+    const int cx = plotX + i * cellW + cellW / 2;
+    const bool isToday = (i == STATS_DAYS - 1);
+
+    int bh = 0;
+    if (days[i] > 0) {
+      bh = (int)((days[i] * (long)plotH) / yMax);
+      if (bh < 1) bh = 1;              // a worked minute must leave a mark
+      // Rounding the scale up past the peak keeps a bar off the gridline, but
+      // only just: a peak of 3599s against a 3600s scale is 99.9% of the plot
+      // and its own value label would sit above the top rule. Reserve the
+      // label's height outright rather than relying on the scale to do it.
+      if (bh > plotH - 9) bh = plotH - 9;
+      canvas.fillRect(cx - barW / 2, base - bh, barW, bh, C_ACCENT);
+    }
+
+    if (days[i] > 0 && (i == peakIdx || isToday)) {
+      fmtShort(days[i], buf, sizeof(buf));
+      canvas.setFont(&fontTiny);
+      canvas.setTextDatum(bottom_center);
+      canvas.setTextColor(C_TEXT, C_BG);
+      canvas.drawString(buf, cx, base - bh - 1);
+    }
+
+    if (wdayToday >= 0) {
+      int wd = (wdayToday - (STATS_DAYS - 1 - i) + 14) % 7;
+      char one[2] = { initials[wd], '\0' };
+      canvas.setFont(&fontTiny);
+      canvas.setTextDatum(top_center);
+      canvas.setTextColor(isToday ? C_TEXT : C_DIM, C_BG);
+      canvas.drawString(one, cx, base + 2);
+    }
+  }
+}
+
+// Today's attention as a part-to-whole across focused / distracted / away.
+// Only called when hasAttentionToday() already said there is something here.
+//
+// The ratio counts focused against distracted and ignores time away, matching
+// focus_daily() and the dashboard: being out of the room is not a lapse in
+// attention, and a bathroom break should not read as one.
+static void drawAttentionBar(int x, int y, int w, int h) {
+  long foc, dis, away;
+  int ratio;
+  STATS_TAKE();
+  foc = statFocused; dis = statDistracted; away = statAway; ratio = statRatio;
+  STATS_GIVE();
+
+  const long total = foc + dis + away;
+  if (total <= 0) return;
+
+  const int midY = y + h / 2;
+
+  canvas.setFont(&fontLabel);
+  canvas.setTextDatum(middle_left);
+  canvas.setTextColor(C_DIM, C_BG);
+  canvas.drawString("attention", x, midY);
+
+  char buf[8];
+  snprintf(buf, sizeof(buf), "%d%%", ratio);
+  canvas.setTextDatum(middle_right);
+  canvas.setTextColor(C_TEXT, C_BG);
+  canvas.drawString(buf, x + w, midY);
+  const int pctW = canvas.textWidth(buf);
+
+  const int barX = x + 56;
+  const int barW = (x + w - pctW - 8) - barX;
+  if (barW < 24) return;                 // no room for the bar; numbers stand
+  const int barH = 8, barY = midY - barH / 2;
+
+  canvas.fillRoundRect(barX, barY, barW, barH, barH / 2, C_TRACK);
+
+  const int wf = (int)((foc * (long)barW) / total);
+  const int wd = (int)((dis * (long)barW) / total);
+  const int wa = barW - wf - wd;          // remainder, so rounding cannot gap
+
+  int cx = barX;
+  if (wf > 0) { canvas.fillRect(cx, barY, wf, barH, C_GOOD); cx += wf; }
+  if (wd > 0) { canvas.fillRect(cx, barY, wd, barH, C_WARN); cx += wd; }
+  if (wa > 0) {  canvas.fillRect(cx, barY, wa, barH, C_DIM); }
+}
+
+// Page 01 — Home. Redesigned 2026-08-17, replacing the clock-and-face layout.
+//
+// Nothing on this page is accumulated on-device. The chart and the attention
+// bar are drawn straight from /api/stats/hub, which computes both in Postgres,
+// so §4 holds: the device still emits events and never totals.
+//
+// Vertical budget for the 240px panel, measured rather than guessed:
+//   0..64    clock + date left, session state + elapsed right, rule between
+//   66       hairline
+//   70..100  four readings — temp, humidity, feels like, light
+//   102      hairline
+//   105..    week chart, which grows into the attention strip's space when
+//            there is no attention data. That is most days: the vision page
+//            is a calibration tool, not an always-on tracker, and a strip
+//            permanently reading "no data" is a hole in the layout.
+//   199..217 attention strip, only when today has data
+//   218      hairline
+//   220..236 tasks · wi-fi · camera
+//   237      page dots, at the very bottom edge
+//
+// Pressure moved off this page. Five readings left ~64px each and forced the
+// labels down to a size you cannot read from a chair; four fit at 78px. It is
+// the least glanceable of the five, so it stays on Status.
+static void pageHome() {
+  char buf[40];
+
+  // ── clock, date, session ───────────────────────────────────────────────
+  bool isPM = false, haveTm = false;
+  struct tm lt;
+
+  if (timeValid) {
+    time_t now = time(nullptr);
+    localtime_r(&now, &lt);
+    haveTm = true;
     int h12 = lt.tm_hour % 12;
     if (h12 == 0) h12 = 12;              // midnight and noon are 12, not 0
     isPM = lt.tm_hour >= 12;
-    snprintf(buf, sizeof(buf), "%2d:%02d", h12, lt.tm_min);
-    canvas.setTextColor(C_TEXT, C_BG);
+    // No leading pad. drawClock holds every digit still in its own cell, so
+    // the block only changes width once a day going 9 -> 10, rather than
+    // sitting permanently indented behind a blank cell.
+    snprintf(buf, sizeof(buf), "%d:%02d", h12, lt.tm_min);
   } else {
     snprintf(buf, sizeof(buf), "--:--");
-    canvas.setTextColor(C_DIM, C_BG);
   }
 
-  canvas.setFont(&fonts::Font7);
-  canvas.setTextDatum(middle_left);
-  canvas.drawString(buf, 10, 28);
-  int clockW = canvas.textWidth(buf);
+  const int clockEnd = drawClock(buf, 10, 32, timeValid ? C_TEXT : C_DIM);
 
-  if (timeValid) {
-    canvas.setFont(&fonts::Font2);
-    canvas.setTextDatum(middle_left);
-    canvas.setTextColor(C_DIM, C_BG);
-    canvas.drawString(isPM ? "PM" : "AM", 10 + clockW + 6, 36);
+  canvas.setFont(&fontLabel);
+  canvas.setTextColor(C_DIM, C_BG);
+
+  if (haveTm) {
+    canvas.setTextDatum(bottom_left);
+    canvas.drawString(isPM ? "pm" : "am", clockEnd + 5, 44);
+
+    strftime(buf, sizeof(buf), "%a %d %b", &lt);
+    for (char *p = buf; *p; p++) *p = (char)tolower((unsigned char)*p);
+    canvas.setTextDatum(top_left);
+    canvas.drawString(buf, 11, 46);
+  } else {
+    canvas.setTextDatum(top_left);
+    canvas.drawString("waiting for ntp", 11, 46);
   }
 
-  canvas.setFont(&fonts::Font2);
+  canvas.drawFastVLine(202, 8, 48, C_RULE);
+
+  canvas.setFont(&fontLabel);
   canvas.setTextDatum(middle_right);
   canvas.setTextColor(timerState == T_RUNNING ? C_GOOD
                     : timerState == T_PAUSED  ? C_WARN : C_DIM, C_BG);
-  canvas.drawString(timerState == T_RUNNING ? "FOCUS"
-                  : timerState == T_PAUSED  ? "PAUSED" : "IDLE",
-                    SCREEN_W - 10, 14);
+  canvas.drawString(timerState == T_RUNNING ? "focus"
+                  : timerState == T_PAUSED  ? "paused" : "idle",
+                    SCREEN_W - 10, 17);
 
-  // The timer sits in Font4, not Font7, so the clock dominates the strip.
-  fmtHMS(sessionElapsedMs(), buf, sizeof(buf));
-  canvas.setFont(&fonts::Font4);
-  canvas.setTextColor(timerState == T_IDLE ? C_DIM : C_TEXT, C_BG);
-  canvas.drawString(buf, SCREEN_W - 10, 38);
+  // m:ss under an hour, h:mm:ss beyond. A permanent leading "00:" spends the
+  // widest glyphs on the least information.
+  const uint32_t el = sessionElapsedMs() / 1000;
+  if (el >= 3600)
+    snprintf(buf, sizeof(buf), "%lu:%02lu:%02lu", (unsigned long)(el / 3600),
+             (unsigned long)((el / 60) % 60), (unsigned long)(el % 60));
+  else
+    snprintf(buf, sizeof(buf), "%lu:%02lu",
+             (unsigned long)(el / 60), (unsigned long)(el % 60));
 
-  // ── environment row ────────────────────────────────────────────────────
-  // Temperature · humidity · real feel. No weather box: §1 is explicit that
-  // the device senses the room, and an external API would duplicate readings
-  // already taken locally with better provenance.
-  canvas.setFont(&fonts::Font2);
-
-  canvas.setTextDatum(middle_left);
-  canvas.setTextColor(hasTemp ? C_TEXT : C_DIM, C_BG);
-  if (hasTemp) snprintf(buf, sizeof(buf), "%.1f C", tempC);
-  else         snprintf(buf, sizeof(buf), "-- C");
-  canvas.drawString(buf, 12, 66);
-
-  // Humidity when anything can supply it; pressure is the fallback so the
-  // middle cell is never permanently blank on a pressure-only build.
-  canvas.setTextDatum(middle_center);
-  canvas.setTextColor(hasHumidity || hasPressure ? C_TEXT : C_DIM, C_BG);
-  if (hasHumidity)      snprintf(buf, sizeof(buf), "%.0f %%", humidity);
-  else if (hasPressure) snprintf(buf, sizeof(buf), "%.0f hPa", pressHpa);
-  else                  snprintf(buf, sizeof(buf), "-- %%");
-  canvas.drawString(buf, SCREEN_W / 2, 66);
-
+  canvas.setFont(&fontTimer);
   canvas.setTextDatum(middle_right);
-  canvas.setTextColor(hasHumidity ? C_ACCENT : C_DIM, C_BG);
-  if (hasHumidity)      snprintf(buf, sizeof(buf), "feels %.1f C", realFeelC);
-  else if (hasPressure) snprintf(buf, sizeof(buf), "no humidity");
-  else                  snprintf(buf, sizeof(buf), "feels --");
-  canvas.drawString(buf, SCREEN_W - 12, 66);
+  canvas.setTextColor(timerState == T_IDLE ? C_DIM : C_TEXT, C_BG);
+  canvas.drawString(buf, SCREEN_W - 10, 43);
 
-  // ── middle band, 296 x 92 ──────────────────────────────────────────────
-  // The redesign costs us the full-screen timer. Rather than add a page back,
-  // the band becomes the timer while a session runs: same page, different
-  // state, no extra navigation.
-  const int bandY = 82, bandH = 92;
-  const int bandCx = SCREEN_W / 2, bandCy = bandY + bandH / 2;
+  // ── readings ───────────────────────────────────────────────────────────
+  canvas.drawFastHLine(0, 66, SCREEN_W, C_RULE);
 
-  if (timerState == T_IDLE) {
-    drawFace(bandCx, bandCy);
-  } else {
-    fmtHMS(sessionElapsedMs(), buf, sizeof(buf));
-    canvas.setFont(&fonts::Font7);
-    canvas.setTextDatum(middle_center);
-    canvas.setTextColor(timerState == T_RUNNING ? C_GOOD : C_WARN, C_BG);
-    canvas.drawString(buf, bandCx, bandCy);
+  static const int   colX[4]     = { 11, 89, 167, 245 };
+  static const char *colLabel[4] = { "temp", "humidity", "feels like", "light" };
+  char colVal[4][16];
+
+  if (hasTemp)     snprintf(colVal[0], sizeof(colVal[0]), "%.1f\xC2\xB0", tempC);
+  else             snprintf(colVal[0], sizeof(colVal[0]), "--");
+
+  if (hasHumidity) snprintf(colVal[1], sizeof(colVal[1]), "%.0f%%", humidity);
+  else             snprintf(colVal[1], sizeof(colVal[1]), "--");
+
+  if (hasHumidity) snprintf(colVal[2], sizeof(colVal[2]), "%.1f\xC2\xB0", realFeelC);
+  else             snprintf(colVal[2], sizeof(colVal[2]), "--");
+
+  if (!luxOk)         snprintf(colVal[3], sizeof(colVal[3]), "--");
+  // Four digits of lux would run into the next column, and above 999 the exact
+  // figure has stopped meaning anything to a person looking at a desk.
+  else if (lux > 999) snprintf(colVal[3], sizeof(colVal[3]), "999+");
+  else                snprintf(colVal[3], sizeof(colVal[3]), "%.0f", lux);
+
+  const bool colOk[4] = { hasTemp, hasHumidity, hasHumidity, luxOk };
+
+  for (int i = 0; i < 4; i++) {
+    canvas.setFont(&fontLabel);
+    canvas.setTextDatum(top_left);
+    canvas.setTextColor(C_DIM, C_BG);
+    canvas.drawString(colLabel[i], colX[i], 70);
+
+    canvas.setFont(&fontValue);
+    canvas.setTextDatum(top_left);
+    canvas.setTextColor(colOk[i] ? C_TEXT : C_DIM, C_BG);
+    canvas.drawString(colVal[i], colX[i], 84);
   }
 
-  // ── bottom bar ─────────────────────────────────────────────────────────
-  // Everything the endpoint returns is open, so the count is the list length.
+  canvas.drawFastHLine(0, 102, SCREEN_W, C_RULE);
+
+  // ── week chart, plus attention when today has any ──────────────────────
+  const bool attn = hasAttentionToday();
+  drawWeekChart(6, 105, SCREEN_W - 12, attn ? 92 : 111);
+  if (attn) drawAttentionBar(11, 199, SCREEN_W - 22, 18);
+
+  // ── bottom row ─────────────────────────────────────────────────────────
+  canvas.drawFastHLine(0, 218, SCREEN_W, C_RULE);
+
   TODO_TAKE();
-  int remaining = todoCount;
-  bool fetched  = todosFetched;
+  const int  remaining = todoCount;
+  const bool fetched   = todosFetched;
   TODO_GIVE();
 
-  canvas.setFont(&fonts::Font2);
+  canvas.setFont(&fontLabel);
   canvas.setTextDatum(middle_left);
   canvas.setTextColor(remaining ? C_TEXT : C_DIM, C_BG);
   if (!fetched) snprintf(buf, sizeof(buf), "tasks ...");
-  else          snprintf(buf, sizeof(buf), "%d task%s left",
+  else          snprintf(buf, sizeof(buf), "%d task%s",
                          remaining, remaining == 1 ? "" : "s");
-  canvas.drawString(buf, 12, 200);
+  canvas.drawString(buf, 11, 228);
 
-  // Vision is Phase 4. Until the phone posts focus samples the honest state is
-  // standalone, so the pill says so rather than implying a tier that is not
-  // running.
-  const int pillW = 104, pillH = 22;
-  const int pillX = SCREEN_W - 12 - pillW, pillY = 200 - pillH / 2;
-  canvas.fillRoundRect(pillX, pillY, pillW, pillH, pillH / 2, C_PANEL);
-  canvas.setTextDatum(middle_center);
-  canvas.setTextColor(C_DIM, C_PANEL);
-  canvas.drawString("STANDALONE", pillX + pillW / 2, 200);
+  canvas.drawFastVLine(106, 221, 14, C_RULE);
+  canvas.drawFastVLine(212, 221, 14, C_RULE);
+
+  canvas.setTextDatum(middle_left);
+  if (netState == NET_UP) {
+    snprintf(buf, sizeof(buf), "wifi %d", WiFi.RSSI());
+    canvas.setTextColor(C_DIM, C_BG);
+  } else if (netState == NET_CONNECTING) {
+    snprintf(buf, sizeof(buf), "wifi ...");
+    canvas.setTextColor(C_WARN, C_BG);
+  } else {
+    snprintf(buf, sizeof(buf), "no wifi");
+    canvas.setTextColor(C_WARN, C_BG);
+  }
+  canvas.drawString(buf, 118, 228);
+
+  // Camera. Amber only while a session is running with nothing watching —
+  // an unopened /vision tab is the normal resting state, not a fault, and a
+  // warning colour permanently lit is how a screen teaches you to ignore it.
+  const char *camText;
+  uint16_t    camCol;
+  if (!camOnline) {
+    camText = camLastOk ? "cam lost" : "standalone";
+    camCol  = camLastOk ? C_WARN : C_DIM;
+  } else if (!camViewer) {
+    camText = "no viewer";
+    camCol  = (timerState == T_RUNNING) ? C_WARN : C_DIM;
+  } else if (timerState == T_RUNNING) {
+    camText = "tracking";
+    camCol  = C_GOOD;
+  } else {
+    camText = "vision ready";
+    camCol  = C_DIM;
+  }
+
+  canvas.setTextDatum(middle_right);
+  canvas.setTextColor(camCol, C_BG);
+  canvas.drawString(camText, SCREEN_W - 10, 228);
 }
 
 // Page 02 — Tasks. Layout unchanged by the redesign; the contents now come
@@ -1161,11 +1707,11 @@ static void pageTasks() {
   if (todoCount == 0) {
     bool fetched = todosFetched;
     TODO_GIVE();
-    canvas.setFont(&fonts::Font2);
+    canvas.setFont(&fontBody);
     canvas.setTextDatum(middle_center);
     canvas.setTextColor(fetched ? C_DIM : C_WARN, C_BG);
-    canvas.drawString(fetched ? "Nothing open"
-                              : "Waiting for the dashboard...",
+    canvas.drawString(fetched ? "nothing open"
+                              : "waiting for the dashboard...",
                       SCREEN_W / 2, SCREEN_H / 2);
     return;
   }
@@ -1175,7 +1721,7 @@ static void pageTasks() {
   if (first > todoCount - visible) first = todoCount - visible;
   if (first < 0) first = 0;
 
-  canvas.setFont(&fonts::Font2);
+  canvas.setFont(&fontBody);
   for (int i = 0; i < visible && first + i < todoCount; i++) {
     int idx = first + i;
     int y = top + i * rowH;
@@ -1193,33 +1739,29 @@ static void pageTasks() {
     // filters done items out — and a checkbox on a device that cannot toggle
     // one would promise an interaction that does not exist.
     //
-    // Titles are free text from the dashboard, so they have to be clipped:
-    // drawString does not bound itself and a long one would run off the panel.
-    // 264px at ~8px per Font2 char is about 33 characters.
-    char shown[36];
-    const char *t = todos[idx].title;
-    if (strlen(t) > 33) {
-      memcpy(shown, t, 31);
-      shown[31] = '.'; shown[32] = '.'; shown[33] = '\0';
-    } else {
-      snprintf(shown, sizeof(shown), "%s", t);
-    }
-
+    // Titles are free text from the dashboard and drawString does not bound
+    // itself, so a long one runs off the panel. Clipped by the renderer rather
+    // than truncated at a character count: the face is proportional, so "33
+    // characters" is one width for "iiii" and quite another for "WWWW", and
+    // the old count was measured against Font2 anyway.
     canvas.setTextColor(sel && todoScrollMode ? C_BG : C_TEXT, bg);
-    canvas.drawString(shown, 40, y + rowH / 2 - 2);
+    canvas.setClipRect(40, y, SCREEN_W - 16 - 40, rowH - 4);
+    canvas.drawString(todos[idx].title, 40, y + rowH / 2 - 2);
+    canvas.clearClipRect();
   }
 
   TODO_GIVE();
 
+  canvas.setFont(&fontLabel);
   canvas.setTextDatum(middle_center);
   canvas.setTextColor(C_DIM, C_BG);
-  canvas.drawString(todoScrollMode ? "Turn to scroll  -  press to exit"
-                                   : "Press knob to scroll list",
-                    SCREEN_W / 2, SCREEN_H - 28);
+  canvas.drawString(todoScrollMode ? "turn to scroll  -  press to exit"
+                                   : "press knob to scroll list",
+                    SCREEN_W / 2, SCREEN_H - 22);
 }
 
 static void statusRow(int y, const char *label, const char *value, uint16_t col) {
-  canvas.setFont(&fonts::Font2);
+  canvas.setFont(&fontLabel);
   canvas.setTextDatum(middle_left);
   canvas.setTextColor(C_DIM, C_BG);
   canvas.drawString(label, 12, y);
@@ -1288,6 +1830,16 @@ static void pageStatus() {
   // GET client yet, so today's figure belongs here once it can fetch it —
   // inventing one on-device is exactly what §4 forbids.
   fmtHMS(sessionElapsedMs(), buf, sizeof(buf));
+
+  // The vision tier rides on this row rather than claiming one of its own:
+  // the page is full at y=200 and the next slot down collides with the page
+  // dots at 230. Only shown when the camera is actually reachable — a blank
+  // here means standalone, which the pill on Home already says.
+  if (camOnline) {
+    strncat(buf, camViewer ? "  vision on" : "  no viewer",
+            sizeof(buf) - strlen(buf) - 1);
+  }
+
   statusRow(174, "Session", buf,
             timerState == T_RUNNING ? C_GOOD
           : timerState == T_PAUSED  ? C_WARN : C_DIM);
@@ -1442,9 +1994,10 @@ void setup() {
   attachInterrupt(PIN_ENC_CLK, encISR, CHANGE);
   attachInterrupt(PIN_ENC_DT,  encISR, CHANGE);
 
-  evqLock  = xSemaphoreCreateMutex();
-  todoLock = xSemaphoreCreateMutex();
-  if (!evqLock || !todoLock) {
+  evqLock   = xSemaphoreCreateMutex();
+  todoLock  = xSemaphoreCreateMutex();
+  statsLock = xSemaphoreCreateMutex();
+  if (!evqLock || !todoLock || !statsLock) {
     Serial.println("FATAL: could not create the queue mutexes.");
     while (true) delay(1000);
   }

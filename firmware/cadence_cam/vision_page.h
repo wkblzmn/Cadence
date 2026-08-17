@@ -31,6 +31,10 @@ static const char VISION_PAGE[] PROGMEM = R"HTMLPAGE(
   .row { display:flex; justify-content:space-between; gap:12px;
          border-bottom:1px solid rgba(255,255,255,.1); padding:5px 0; font-size:13px; }
   .k { color:#898781; } .v { font-variant-numeric:tabular-nums; }
+  .sess-on { color:#0ca30c; font-weight:600; } .sess-off { color:#898781; }
+  /* Idle is the resting state, so it must not look like a fault. Dimming the
+     readouts says "not recording" without implying "broken". */
+  .idle .state, .idle #yaw, .idle #pitch, .idle #gaze { opacity:.55; }
   .note { color:#898781; font-size:12px; margin-top:10px; line-height:1.5; }
   button { background:#3987e5; color:#fff; border:0; border-radius:6px;
            padding:7px 12px; font-size:13px; cursor:pointer; margin-top:10px; }
@@ -46,6 +50,7 @@ static const char VISION_PAGE[] PROGMEM = R"HTMLPAGE(
   <div class="panel">
     <div class="k" style="font-size:12px">Current state</div>
     <div class="state absent" id="state">starting</div>
+    <div class="row"><span class="k">session</span><span class="v sess-off" id="sess">checking</span></div>
     <div class="row"><span class="k">yaw</span><span class="v" id="yaw">-</span></div>
     <div class="row"><span class="k">pitch</span><span class="v" id="pitch">-</span></div>
     <div class="row"><span class="k">gaze</span><span class="v" id="gaze">-</span></div>
@@ -58,6 +63,11 @@ static const char VISION_PAGE[] PROGMEM = R"HTMLPAGE(
     <p class="note">
       Look straight at your screen and press calibrate. Everything is measured
       relative to that, so the camera does not need to be centred.
+    </p>
+    <p class="note">
+      Recording follows the hub's focus-timer button — leave this tab open and
+      it starts and stops on its own. Nothing is recorded while the session is
+      idle. Add <code>?free=1</code> to record without a hub.
     </p>
     <p class="note" id="err"></p>
   </div>
@@ -84,6 +94,14 @@ const GAZE_LIMIT  = parseFloat(P.get("gaze")  ?? "0.35");  // blendshape score
 const HZ          = parseFloat(P.get("hz")    ?? "4");     // inference rate
 const WINDOW_MS   = parseInt  (P.get("window")?? "2000");  // one sample per window
 const POST_MS     = parseInt  (P.get("post")  ?? "10000"); // batch upload interval
+const SESS_MS     = parseInt  (P.get("sess")  ?? "2000");  // session poll interval
+
+// Recording normally follows the hub's focus-timer button. `?free=1` cuts that
+// link and records continuously, which is how this page was used through all
+// of Phase 4 and is still the right mode for calibrating on a bare bench with
+// no hub running. It is deliberately not the default: samples that belong to
+// no session are what made a closed tab look like four hours of focus.
+const FREE_RUN    = P.get("free") === "1";
 
 // The stream is on port 81; this page is served from port 80 on the same host.
 img.src = `http://${location.hostname}:81/stream`;
@@ -92,6 +110,56 @@ let landmarker = null, centre = null, sent = 0, lastGaze = 0;
 const votes = [];
 const pending = [];
 let tickCount = 0, rateAt = performance.now();
+
+// ── session gating ───────────────────────────────────────────────────────
+//
+// The hub's focus-timer button is what starts and stops recording. This page
+// cannot see that button, and the hub cannot address this tab, so both of
+// them meet at GET /session on the camera board: the hub writes the state,
+// this page reads it.
+//
+// The page stays loaded either way. The model is ~7 MB and the stream takes a
+// moment to come up, so tearing either down between sessions would put that
+// cost on the start of every session — where it would look exactly like the
+// button not working. Instead it idles: preview live, calibration available,
+// nothing recorded.
+
+let sampling = false;
+
+function setSampling(on, label) {
+  const el = $("sess");
+  el.textContent = label;
+  el.className = "v " + (on ? "sess-on" : "sess-off");
+  document.body.classList.toggle("idle", !on);
+
+  if (on === sampling) return;
+  sampling = on;
+
+  if (on) {
+    // Frames seen before the button was pressed belong to no session.
+    votes.length = 0;
+  } else {
+    // Close the open window and get everything up now rather than holding a
+    // partial batch behind the next timer. Whatever is still in `pending`
+    // when the tab closes never existed as far as the database is concerned.
+    flush();
+    post();
+  }
+}
+
+async function pollSession() {
+  if (FREE_RUN) { setSampling(true, "free-run"); return; }
+  try {
+    const r = await fetch("/session", { cache: "no-store" });
+    const j = await r.json();
+    setSampling(j.state === "running", j.state);
+  } catch (e) {
+    // One failed poll is not a stopped session — the board expires the state
+    // by itself if the hub has really gone away, so keep doing whatever we
+    // were doing and just say the link is down.
+    $("sess").textContent = "board unreachable";
+  }
+}
 
 try {
   const fileset = await FilesetResolver.forVisionTasks(
@@ -189,7 +257,10 @@ function tick() {
   tickCount++;
   const r = classify(res);
   lastLm = res?.faceLandmarks?.[0] ?? null;
-  votes.push(r.state);
+  // Classification always runs, so the readouts stay live and calibration
+  // works between sessions. Only the vote is gated — the vote is the thing
+  // that eventually becomes a row in focus_samples.
+  if (sampling) votes.push(r.state);
 
   $("state").textContent = r.state;
   $("state").className = "state " + r.state;
@@ -258,8 +329,25 @@ async function post() {
   }
 }
 
-setInterval(tick, Math.max(60, 1000 / HZ));
-setInterval(flush, WINDOW_MS);
+// Idle ticks at 1 Hz rather than the full rate: the preview and the readouts
+// stay live so calibration works before a session starts, without spending GPU
+// on inference nothing is recording. A setInterval cannot change its own
+// period, so this reschedules itself instead.
+function tickLoop() {
+  tick();
+  setTimeout(tickLoop, sampling ? Math.max(60, 1000 / HZ) : 1000);
+}
+tickLoop();
+
+// Only the window timer is gated. `post` keeps its own schedule so the last
+// batch of a finished session still goes up, and it returns immediately when
+// there is nothing pending.
+setInterval(() => { if (sampling) flush(); }, WINDOW_MS);
 setInterval(post, POST_MS);
+
+// Ask once immediately — otherwise pressing the button and watching this page
+// means staring at "checking" for a poll interval, which reads as a failure.
+pollSession();
+setInterval(pollSession, SESS_MS);
 </script>
 )HTMLPAGE";

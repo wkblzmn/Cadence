@@ -1,12 +1,18 @@
 // ─────────────────────────────────────────────────────────────────────────
 //  Cadence — camera board firmware
 //  Target : ESP32-S3-CAM N16R8 + OV3660
-//  Role   : put an MJPEG stream on the LAN. Nothing more.
+//  Role   : put an MJPEG stream on the LAN, serve the page that watches it,
+//           and hold the session state that decides when it records.
 //
-//  This board does no vision work. It is a camera on the network; the phone
-//  runs MediaPipe against this stream and POSTs focus samples to the backend.
-//  Keeping inference off the S3 is the whole reason the vision tier is a
-//  separate tier — on-device vision is parked in Argus, not built here.
+//  This board does no vision work. A browser tab does — it loads /vision from
+//  here, runs MediaPipe against the stream, and POSTs focus samples back for
+//  relaying. Keeping inference off the S3 is the whole reason the vision tier
+//  is a separate tier; on-device vision is parked in Argus, not built here.
+//
+//  There is no phone in the built design, despite what the original plan said:
+//  the vision host is a browser on the desktop. What matters about that is
+//  that nothing records unless a tab is open, which is why the hub's Home
+//  screen has a pill that can say NO VIEWER.
 //
 //  Pin map confirmed on hardware by 07_bringup_camera: the layout the ESP32
 //  core calls ESP32S3_EYE, which is also the generic S3-CAM layout. Sensor
@@ -502,6 +508,82 @@ static bool httpBegin(HTTPClient &http, const String &url) {
   return true;
 }
 
+// ── session gating ───────────────────────────────────────────────────────
+//
+// The hub owns the session; this board only remembers what it was last told.
+// The hub cannot address a browser tab and the tab cannot see a button on the
+// hub, so the state lands here — the one place both of them can reach — and
+// the vision page asks a single question: should I be sampling right now?
+//
+// Expiry is as load-bearing as the state itself. If the hub loses power
+// mid-session nothing would ever clear "running": the page would sample all
+// night and focus_islands() would report one unbroken run that never
+// happened, which is the exact failure its sample-gap guard exists to
+// prevent. So the hub re-asserts while a session lives, and anything this
+// board stops hearing about decays back to idle on its own.
+//
+// The TTL is three times the hub's re-assert interval — long enough that one
+// lost packet is not a dropped session, short enough that a dead hub costs a
+// minute and a half rather than an evening.
+
+#define SESSION_TTL_MS 90000UL
+
+static volatile uint8_t  sessionState   = 0;   // 0 idle · 1 running · 2 paused
+static volatile uint32_t sessionHeardAt = 0;
+
+static const char *sessionName(uint8_t s) {
+  return s == 1 ? "running" : s == 2 ? "paused" : "idle";
+}
+
+// The state with the TTL applied. Every reader goes through this rather than
+// touching sessionState, so a stale "running" cannot be observed anywhere.
+static uint8_t sessionNow() {
+  uint8_t s = sessionState;
+  if (s != 0 && millis() - sessionHeardAt > SESSION_TTL_MS) return 0;
+  return s;
+}
+
+// GET /session            — the vision page asking what it should be doing
+// GET /session?state=...  — the hub telling this board what happened
+//
+// Unauthenticated, exactly like /set. This is a LAN-only control surface on a
+// board that already serves its camera to the whole LAN, so a check here
+// would guard nothing that is not already open. Said plainly rather than
+// implied, because the relay next door goes to some trouble to keep the API
+// token off this page and the difference between the two is worth seeing.
+//
+// `viewer` reports whether anything is pulling the stream, which is the
+// closest this board can get to knowing the vision page is open — the page is
+// the only thing that connects to it.
+static void handleSession() {
+  if (server.hasArg("state")) {
+    String want = server.arg("state");
+    uint8_t v = want == "running" ? 1 : want == "paused" ? 2
+              : want == "idle"    ? 0 : 255;
+    if (v == 255) {
+      cors();
+      server.send(400, "application/json",
+                  "{\"error\":\"state must be running, paused or idle\"}");
+      return;
+    }
+    // Ordering matters: the timestamp has to land before the state, or a
+    // reader between the two lines sees "running" carrying the previous
+    // heartbeat's age and expires a session that just started.
+    sessionHeardAt = millis();
+    sessionState   = v;
+  }
+
+  uint8_t s = sessionNow();
+  char buf[160];
+  snprintf(buf, sizeof(buf),
+           "{\"state\":\"%s\",\"viewer\":%s,\"heard_s\":%lu}",
+           sessionName(s),
+           (streamClient && streamClient.connected()) ? "true" : "false",
+           (unsigned long)((millis() - sessionHeardAt) / 1000));
+  cors();
+  server.send(200, "application/json", buf);
+}
+
 static void handleVision() {
   cors();
   server.send_P(200, "text/html", VISION_PAGE);
@@ -605,12 +687,13 @@ static void relayTask(void *) {
 
 static void handleStatus() {
   sensor_t *s = esp_camera_sensor_get();
-  char buf[360];
+  char buf[420];
   snprintf(buf, sizeof(buf),
            "{\"rssi\":%d,\"ip\":\"%s\",\"framesize\":%d,\"quality\":%d,"
            "\"ae_level\":%d,\"brightness\":%d,\"agc_gain\":%d,\"aec_value\":%d,"
            "\"frames_sent\":%lu,\"viewer\":%s,\"uptime_s\":%lu,"
-           "\"relay_sent\":%lu,\"relay_dropped\":%lu,\"relay_status\":%d}",
+           "\"relay_sent\":%lu,\"relay_dropped\":%lu,\"relay_status\":%d,"
+           "\"session\":\"%s\"}",
            WiFi.RSSI(), WiFi.localIP().toString().c_str(),
            s ? (int)s->status.framesize : -1,
            s ? (int)s->status.quality : -1,
@@ -622,7 +705,8 @@ static void handleStatus() {
            (streamClient && streamClient.connected()) ? "true" : "false",
            (unsigned long)(millis() / 1000),
            (unsigned long)relaySent, (unsigned long)relayDropped,
-           relayLastStatus);
+           relayLastStatus,
+           sessionName(sessionNow()));
   cors();
   server.send(200, "application/json", buf);
 }
@@ -755,6 +839,7 @@ void setup() {
   server.on("/status", handleStatus);
   server.on("/set", handleSet);
   server.on("/vision", handleVision);
+  server.on("/session", handleSession);
   server.on("/focus", HTTP_POST, handleFocus);
   server.on("/focus", HTTP_OPTIONS, handleFocus);
   server.begin();

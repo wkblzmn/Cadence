@@ -258,7 +258,20 @@ If upload fails: hold BOOT, tap RESET, release BOOT.
 |---|---|---|
 | LovyanGFX | lovyan03 | **not TFT_eSPI** — see below |
 | Adafruit BME280 Library | Adafruit | pulls in Adafruit_Sensor + BusIO |
+| Adafruit BMP280 Library | Adafruit | the part actually fitted |
+| DHT sensor library for ESPx | beegee_tokyo | `DHTesp`, for the DHT22 |
 | BH1750 | Christopher Laws | |
+| U8g2 | olikraus | **font tables only** — see below |
+
+**U8g2 is not driving a display here.** It is included for its font data, which
+LovyanGFX renders through `lgfx::U8g2font`. That combination is what retired
+the seven-segment `Font7` clock and the 8px `Font2` labels: the hub now uses
+real Helvetica bitmaps and a `logisoso` clock face, and the `_tf` variants
+carry the full Latin-1 range so `°C` is typeset rather than drawn.
+
+Each U8g2 font lives in its own linker section, so `--gc-sections` (on by
+default in the ESP32 core) drops the ~2000 faces the sketch never names. If the
+binary ever grows by hundreds of KB, that is the setting to check first.
 
 **Do not switch back to TFT_eSPI.** It crashes on `init()` with the ESP32-S3 on
 Arduino-ESP32 core 3.x — `StoreProhibited`, register dump confirmed, reproduced
@@ -293,7 +306,62 @@ Credentials live in `firmware/cadence_hub/secrets.h`, which is gitignored.
   phone hotspot with an SSID you control and set it before the demo.
 - **`API_BASE`** points at the deployed dashboard. A LAN address works for
   development but is a DHCP lease and will move.
+- **`CAM_HOST`** is optional and points at the camera board. Left unset it
+  defaults to `cadence-cam.local`, the mDNS name the camera already
+  advertises. Set it to a bare IP if mDNS does not resolve — see below.
 - The ESP32-S3 has **no 5 GHz radio**. The network must be 2.4 GHz.
 
 Timezone is `<+06>-6` for Dhaka. The POSIX sign is inverted — east of Greenwich
 is negative. This affects local display only; timestamps on the wire are UTC.
+
+---
+
+## Vision tier — how the button reaches the camera
+
+There is no wire between the two boards. They meet on the LAN, and the chain
+has one link in it that is not a device at all.
+
+```
+[timer button] -> hub -> GET /session?state=running -> camera board
+                                                          |
+                              browser tab on /vision  <- polls /session
+                                      |
+                           MediaPipe (in the tab, not on the board)
+                                      |
+                           POST /focus -> camera relay -> Vercel -> Neon
+```
+
+**The camera board does not do the tracking.** It has no inference on it at
+all — it serves an MJPEG stream and a web page, and the page runs MediaPipe in
+the browser. So "the camera is tracking" always means *a browser tab is open
+on `http://cadence-cam.local/vision`*. Nothing records if it is closed.
+
+The hub therefore cannot start tracking directly; it can only arm it. It tells
+the camera board what the session is doing, the board holds that state, and
+the open page polls for it every 2 s and starts or stops recording to match.
+
+| Hub pill (Home, bottom right) | Means |
+|---|---|
+| `STANDALONE` | No camera has ever answered. Supported mode, not a fault. |
+| `CAM LOST` | It answered before and has stopped. Check power and Wi-Fi. |
+| `NO VIEWER` | Board is up, **the `/vision` tab is not open.** Nothing is being recorded. |
+| `READY` | Tab open, waiting for the timer button. |
+| `TRACKING` | Session running and being recorded. |
+
+**`NO VIEWER` is the one to know.** Press the button, get a session, and record
+nothing — because the page that does the work was never opened. The pill is
+the only place that is visible from the chair.
+
+### Failure tells
+
+| Symptom | Cause |
+|---|---|
+| Pill stuck on `STANDALONE`, board serves `/vision` fine in a browser | mDNS not resolving. Set `CAM_HOST` to the board's IP in the hub's `secrets.h` and reflash. |
+| Session state on the page lags the button by a few seconds | Normal. The page polls every 2 s; `?sess=1000` halves it. |
+| Page keeps recording ~90 s after the hub loses power | Also normal, and deliberate. The board expires a session it stops hearing about; the hub re-asserts every 30 s and the TTL is 3× that. |
+| Nothing in `focus_samples` despite `TRACKING` | The relay, not the gating. Check `/status` on the camera for `relay_status`. |
+
+The page can still be run without a hub: `http://cadence-cam.local/vision?free=1`
+records continuously, which is what calibration on a bare bench needs. It is
+not the default, because samples belonging to no session are exactly what made
+a tab left open overnight report an unbroken four-hour focus.
