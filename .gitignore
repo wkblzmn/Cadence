@@ -41,3 +41,9 @@ ehthumbs.db
 Desktop.ini
 $RECYCLE.BIN/
 .DS_Store
+# ── vision host ──────────────────────────────────────────────────────────
+# The Face Landmarker model is ~3.7 MB of redistributable binary and the
+# calibration is per-desk, per-chair. Neither belongs in the repo.
+vision/face_landmarker.task
+vision/calibration.json
+vision/__pycache__/

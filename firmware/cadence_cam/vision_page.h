@@ -65,9 +65,10 @@ static const char VISION_PAGE[] PROGMEM = R"HTMLPAGE(
       relative to that, so the camera does not need to be centred.
     </p>
     <p class="note">
-      Recording follows the hub's focus-timer button — leave this tab open and
-      it starts and stops on its own. Nothing is recorded while the session is
-      idle. Add <code>?free=1</code> to record without a hub.
+      This page previews and calibrates. It does not record — the headless host
+      in <code>vision/</code> does, so the hub's focus-timer button works with
+      no tab open. Add <code>?free=1</code> to record from here instead, with
+      the host stopped.
     </p>
     <p class="note" id="err"></p>
   </div>
@@ -152,7 +153,15 @@ async function pollSession() {
   try {
     const r = await fetch("/session", { cache: "no-store" });
     const j = await r.json();
-    setSampling(j.state === "running", j.state);
+    // Preview only. vision/cadence_vision.py is the recorder now — it runs
+    // headless so the focus-timer button works without a tab being open.
+    //
+    // This page must NOT also sample. Both would classify the same seconds and
+    // post them under timestamps a few milliseconds apart, which the
+    // (device_id, ts) unique index cannot collapse, so every attention figure
+    // would quietly double whenever this tab happened to be open. Use ?free=1
+    // to record from here deliberately, with the host stopped.
+    setSampling(false, j.state + " - preview only");
   } catch (e) {
     // One failed poll is not a stopped session — the board expires the state
     // by itself if the hub has really gone away, so keep doing whatever we
