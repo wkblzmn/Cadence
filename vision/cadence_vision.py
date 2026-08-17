@@ -189,16 +189,52 @@ def calibrate(host, landmarker, seconds=6.0):
           f"gaze {centre['gaze']:.3f}")
 
 
-def open_stream(host):
+LOG = os.path.join(HERE, "host.log")
+
+
+def log(msg):
+    """Print and append. This runs unattended from a login task, where a
+    traceback on a stdout nobody is watching is the same as no diagnosis at
+    all."""
+    line = f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}  {msg}"
+    print(line, flush=True)
+    try:
+        if os.path.exists(LOG) and os.path.getsize(LOG) > 1_000_000:
+            os.replace(LOG, LOG + ".1")
+        with open(LOG, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception:
+        pass                       # logging must never be the thing that fails
+
+
+def open_stream(host, patient=True):
+    """Open the MJPEG stream, retrying rather than exiting.
+
+    Exiting was wrong for anything that starts at login: the PC boots faster
+    than the camera board joins the network, so a host that gives up on the
+    first attempt is a host that is never running when you sit down. It also
+    has to survive the board rebooting mid-session, which it does.
+    """
     url = f"http://{host}:81/stream"
-    cap = cv2.VideoCapture(url)
-    if not cap.isOpened():
-        sys.exit(f"cannot open {url} — is the board powered and on this network?")
-    # Keep the buffer shallow: a backlog would hand the classifier frames from
-    # several seconds ago, which for a 2s voting window is enough to attribute
-    # attention to the wrong window entirely.
-    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-    return cap
+    delay, attempt = 2, 0
+    while True:
+        attempt += 1
+        cap = cv2.VideoCapture(url)
+        if cap.isOpened():
+            # Keep the buffer shallow: a backlog would hand the classifier
+            # frames from several seconds ago, which for a 2s voting window is
+            # enough to attribute attention to the wrong window entirely.
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            if attempt > 1:
+                log(f"stream open after {attempt} attempts")
+            return cap
+        cap.release()
+        if not patient:
+            return None
+        if attempt in (1, 5) or attempt % 30 == 0:
+            log(f"cannot open {url} (attempt {attempt}) — waiting for the board")
+        time.sleep(delay)
+        delay = min(delay * 2, 30)     # back off, then keep trying forever
 
 
 def session_state(host, timeout=3.0):
@@ -231,7 +267,18 @@ def run(host, free_run=False, verbose=False):
               "everything will come back distracted.")
 
     landmarker = make_landmarker()
-    cap = None
+
+    # Open the stream once, for the life of the process, and keep reading from
+    # it even when no session is running.
+    #
+    # This is not an optimisation, it is what makes the hub's pill truthful. The
+    # board reports `viewer` by asking whether anything is pulling the stream,
+    # and the browser tab it replaced held that connection open the entire time
+    # it was open. An earlier version of this host connected only while
+    # recording, so between sessions the board saw no viewer and the hub said
+    # "no viewer" — which reads as "your camera is broken" when the correct
+    # answer is "a host is attached and waiting for the button".
+    cap = open_stream(host)
 
     sampling = False
     votes = []
@@ -240,8 +287,8 @@ def run(host, free_run=False, verbose=False):
     last_session = last_window = last_post = 0.0
     tick_interval = 1.0 / HZ
 
-    print(f"watching {host} — recording follows the hub's focus-timer button"
-          + (" (FREE RUN: ignoring it)" if free_run else ""))
+    log(f"watching {host} — recording follows the hub's focus-timer button"
+        + (" (FREE RUN: ignoring it)" if free_run else ""))
 
     try:
         while True:
@@ -255,29 +302,28 @@ def run(host, free_run=False, verbose=False):
                     sampling = want
                     if sampling:
                         votes.clear()          # frames before the press belong to no session
-                        if cap is None:
-                            cap = open_stream(host)
-                        print("session running — recording")
+                        log("session running — recording")
                     else:
                         # Close the open window and flush, rather than holding a
                         # partial batch that a crash would take with it.
                         if votes:
                             flush_window(votes, pending)
                         drain(host, pending)
-                        print("session idle — stopped")
-                        if cap is not None:
-                            cap.release(); cap = None
+                        log("session idle — waiting for the button")
 
-            if not sampling:
-                time.sleep(0.2)
-                continue
-
-            # ── one inference ─────────────────────────────────────────────
+            # ── always read, so the board keeps seeing a viewer ───────────
+            # The connection is the point even when idle: it is what tells the
+            # hub a host is attached. Frames are read and discarded rather than
+            # left unread, because an unread MJPEG stream backs up on the board.
             ok, frame = cap.read()
             if not ok:
-                print("stream read failed; reopening")
+                log("stream read failed; reopening")
                 cap.release(); cap = open_stream(host)
                 time.sleep(0.5)
+                continue
+
+            if not sampling:
+                time.sleep(0.5)              # idle: keep the pipe warm, cheaply
                 continue
 
             r = detect(landmarker, frame)
@@ -303,14 +349,48 @@ def run(host, free_run=False, verbose=False):
             time.sleep(max(0.0, tick_interval - (time.time() - now)))
 
     except KeyboardInterrupt:
-        print("\nstopping")
-        if votes:
-            flush_window(votes, pending)
-        drain(host, pending)
-        print(f"posted {sent} samples this run")
+        log("stopping")
+        raise
     finally:
-        if cap is not None:
+        # Whatever ends this — Ctrl-C, a board reboot, an unexpected error — the
+        # partial window and the queued batch go up rather than dying with the
+        # process. A sample that was classified and then dropped is worse than
+        # one never taken, because the gap is invisible in the data.
+        try:
+            if votes:
+                flush_window(votes, pending)
+            if pending:
+                drain(host, pending)
+        except Exception:
+            pass
+        try:
             cap.release()
+        except Exception:
+            pass
+        log(f"posted {sent} samples this run")
+
+
+def supervise(host, free_run=False, verbose=False):
+    """Restart run() for as long as the process lives.
+
+    This starts at login and is expected to outlive the things it talks to: the
+    board reboots, mDNS blips, a frame arrives malformed. None of those should
+    end the day's tracking.
+
+    A loop rather than recursion. An earlier version called run() from inside
+    run()'s own exception handler, which works and adds a stack frame every time
+    the board reboots — a leak whose eventual symptom would be very hard to
+    connect back to a camera power-cycle a week earlier.
+    """
+    while True:
+        try:
+            run(host, free_run=free_run, verbose=verbose)
+            return                       # a clean return means we are finished
+        except KeyboardInterrupt:
+            return
+        except Exception as e:
+            log(f"restarting after {type(e).__name__}: {e}")
+            time.sleep(5)
 
 
 def flush_window(votes, pending):
@@ -361,7 +441,7 @@ def main():
     if a.calibrate:
         calibrate(a.host, make_landmarker())
         return
-    run(a.host, free_run=a.free, verbose=a.verbose)
+    supervise(a.host, free_run=a.free, verbose=a.verbose)
 
 
 if __name__ == "__main__":

@@ -47,3 +47,5 @@ $RECYCLE.BIN/
 vision/face_landmarker.task
 vision/calibration.json
 vision/__pycache__/
+vision/host.log
+vision/host.log.1
