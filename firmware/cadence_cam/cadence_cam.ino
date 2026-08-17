@@ -492,6 +492,20 @@ static void handleFocus() {
     return;
   }
 
+  // The page sends only its samples; device identity is injected here.
+  //
+  // It belongs with the token, in firmware — a page served to the LAN should
+  // not be the thing that decides which device a sample is attributed to, and
+  // hardcoding it in two places is how they drift apart. Splicing it onto the
+  // front is a string operation, not a parse: the backend still validates
+  // every field, and firmware still holds no opinion about the schema.
+  if (body.startsWith("{")) {
+    body = String("{\"device_id\":\"") + DEVICE_ID + "\"," + body.substring(1);
+  } else {
+    server.send(400, "text/plain", "expected a JSON object");
+    return;
+  }
+
   String url = String(API_BASE) + "/api/ingest/focus";
   HTTPClient http;
   if (!httpBegin(http, url)) {
