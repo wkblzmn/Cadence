@@ -447,6 +447,46 @@ static void handleSet() {
 static WiFiClientSecure tlsClient;
 static WiFiClient       plainClient;
 
+// ── the relay queue ──────────────────────────────────────────────────────
+//
+// A WebServer handler must never block. The first version did the TLS
+// handshake to the backend inside handleFocus, which runs on the loop task —
+// so while that handshake sat there, port 80 answered nothing at all: not
+// /vision, not /status. The stream kept running only because it has its own
+// task. Meanwhile the page posted again every 2 s and the board never
+// recovered.
+//
+// So the handler queues and returns, and a task does the network. This is the
+// same split the hub already makes for exactly the same reason, and the
+// comment there says it plainly: HTTPClient blocks, which is why it is not
+// allowed anywhere near loop().
+
+#define RELAY_QUEUE    8
+#define RELAY_BODY_MAX 640
+
+struct RelayItem { char body[RELAY_BODY_MAX]; };
+static RelayItem relayQ[RELAY_QUEUE];
+static uint8_t relayHead = 0, relayCount = 0;
+static SemaphoreHandle_t relayLock = nullptr;
+
+volatile uint32_t relaySent = 0, relayDropped = 0;
+volatile int relayLastStatus = 0;
+
+static bool relayPush(const String &body) {
+  if (body.length() >= RELAY_BODY_MAX) return false;
+  xSemaphoreTake(relayLock, portMAX_DELAY);
+  if (relayCount == RELAY_QUEUE) {          // drop oldest, keep the newest
+    relayHead = (relayHead + 1) % RELAY_QUEUE;
+    relayCount--;
+    relayDropped++;
+  }
+  RelayItem &it = relayQ[(relayHead + relayCount) % RELAY_QUEUE];
+  snprintf(it.body, RELAY_BODY_MAX, "%s", body.c_str());
+  relayCount++;
+  xSemaphoreGive(relayLock);
+  return true;
+}
+
 static bool httpBegin(HTTPClient &http, const String &url) {
   bool opened;
   if (url.startsWith("https://")) {
@@ -506,34 +546,71 @@ static void handleFocus() {
     return;
   }
 
-  String url = String(API_BASE) + "/api/ingest/focus";
-  HTTPClient http;
-  if (!httpBegin(http, url)) {
-    server.send(502, "text/plain", "could not open upstream");
+  // Queue and return. The upstream POST happens on relayTask; blocking here
+  // takes the whole control server down with it.
+  if (!relayPush(body)) {
+    server.send(413, "application/json", "{\"error\":\"body too large\"}");
     return;
   }
-  http.addHeader("Content-Type", "application/json");
-  http.addHeader("Authorization", "Bearer " API_TOKEN);
+  server.send(202, "application/json", "{\"queued\":true}");
+}
 
-  int status = http.POST(body);
-  String reply = status > 0 ? http.getString() : String("upstream unreachable");
-  http.end();
+// Drains the queue. Runs on its own task with a stack big enough for a TLS
+// handshake — roughly 6 KB of it — which is the other half of why this cannot
+// live on the loop task.
+static void relayTask(void *) {
+  for (;;) {
+    bool have = false;
+    static char body[RELAY_BODY_MAX];
 
-  if (status <= 0) {
-    Serial.printf("[FOCUS] upstream failed: %d\n", status);
-    server.send(502, "text/plain", reply);
-    return;
+    xSemaphoreTake(relayLock, portMAX_DELAY);
+    if (relayCount > 0) {
+      memcpy(body, relayQ[relayHead].body, RELAY_BODY_MAX);
+      have = true;
+    }
+    xSemaphoreGive(relayLock);
+
+    if (!have) { vTaskDelay(pdMS_TO_TICKS(200)); continue; }
+
+    String url = String(API_BASE) + "/api/ingest/focus";
+    HTTPClient http;
+    int status = -1;
+    if (httpBegin(http, url)) {
+      http.addHeader("Content-Type", "application/json");
+      http.addHeader("Authorization", "Bearer " API_TOKEN);
+      status = http.POST(String(body));
+      if (status > 0 && (status < 200 || status >= 300)) {
+        Serial.printf("[FOCUS] %d %s\n", status, http.getString().c_str());
+      }
+      http.end();
+    }
+    relayLastStatus = status;
+
+    // 2xx accepted, 4xx is the server rejecting the payload itself and
+    // retrying cannot fix that. Only a 5xx or a transport failure is worth
+    // keeping — same policy the hub applies to its event queue.
+    bool consume = (status >= 200 && status < 500);
+    if (consume) {
+      xSemaphoreTake(relayLock, portMAX_DELAY);
+      if (relayCount > 0) { relayHead = (relayHead + 1) % RELAY_QUEUE; relayCount--; }
+      xSemaphoreGive(relayLock);
+      if (status < 300) relaySent++;
+    } else {
+      Serial.printf("[FOCUS] upstream failed (%d), will retry\n", status);
+      vTaskDelay(pdMS_TO_TICKS(3000));
+    }
+    vTaskDelay(pdMS_TO_TICKS(50));
   }
-  server.send(status, "application/json", reply);
 }
 
 static void handleStatus() {
   sensor_t *s = esp_camera_sensor_get();
-  char buf[256];
+  char buf[360];
   snprintf(buf, sizeof(buf),
            "{\"rssi\":%d,\"ip\":\"%s\",\"framesize\":%d,\"quality\":%d,"
            "\"ae_level\":%d,\"brightness\":%d,\"agc_gain\":%d,\"aec_value\":%d,"
-           "\"frames_sent\":%lu,\"viewer\":%s,\"uptime_s\":%lu}",
+           "\"frames_sent\":%lu,\"viewer\":%s,\"uptime_s\":%lu,"
+           "\"relay_sent\":%lu,\"relay_dropped\":%lu,\"relay_status\":%d}",
            WiFi.RSSI(), WiFi.localIP().toString().c_str(),
            s ? (int)s->status.framesize : -1,
            s ? (int)s->status.quality : -1,
@@ -543,7 +620,9 @@ static void handleStatus() {
            s ? (int)s->status.aec_value : 0,
            (unsigned long)framesSent,
            (streamClient && streamClient.connected()) ? "true" : "false",
-           (unsigned long)(millis() / 1000));
+           (unsigned long)(millis() / 1000),
+           (unsigned long)relaySent, (unsigned long)relayDropped,
+           relayLastStatus);
   cors();
   server.send(200, "application/json", buf);
 }
@@ -682,6 +761,15 @@ void setup() {
 
   // Own task so a connected viewer can never block the control server.
   xTaskCreatePinnedToCore(streamTask, "stream", 4096, nullptr, 1, nullptr, 1);
+
+  // Same reasoning for the upstream POST: TLS blocks, and the handler that
+  // queues it must not. 12 KB because the handshake alone wants about 6.
+  relayLock = xSemaphoreCreateMutex();
+  if (!relayLock) {
+    Serial.println("FATAL: could not create the relay mutex.");
+    while (true) delay(1000);
+  }
+  xTaskCreatePinnedToCore(relayTask, "relay", 12288, nullptr, 1, nullptr, 0);
 
   String ip = WiFi.localIP().toString();
   Serial.printf("Wi-Fi   : up, ip=%s rssi=%d\n", ip.c_str(), WiFi.RSSI());
