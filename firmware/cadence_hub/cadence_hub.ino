@@ -157,14 +157,26 @@ LGFX_Sprite canvas(&tft);
 // something the datasheet-free font table will tell you, and a clock with no
 // colon is not worth 4 KB of a 3 MB partition.
 //
-// Nothing here is proportional-safe for a clock — see drawClock(), which
-// places digits in fixed cells so the time does not jitter as 1 swaps for 8.
-static const lgfx::U8g2font fontClock(u8g2_font_logisoso42_tr);
-static const lgfx::U8g2font fontTimer(u8g2_font_helvB24_tf);
-static const lgfx::U8g2font fontValue(u8g2_font_helvB14_tf);
+// Three levels, far apart. The previous set ran 10/14/24/42, where the 10 and
+// 14 collapsed into one level and did the work of neither — contrast is what
+// makes a hierarchy, not variety.
+//
+// A display face for the numerals and a text face for the small copy is a
+// deliberate pairing rather than an inconsistency: logisoso is drawn for large
+// digits and is clumsy at 12px, helvR is the reverse.
+//
+// To audition alternatives, change one line each. Clock: logisoso42/46_tr,
+// fub42_tf (heavier, humanist), osb41_tf. Text: helvR10/14_tf, or profont for
+// something monospaced.
+static const lgfx::U8g2font fontHero (u8g2_font_logisoso38_tr);  // the clock
+static const lgfx::U8g2font fontTimer(u8g2_font_logisoso26_tf);  // elapsed
+static const lgfx::U8g2font fontText (u8g2_font_helvR12_tf);     // values
+static const lgfx::U8g2font fontTiny (u8g2_font_helvR08_tf);     // labels
+
+// Pages 02 and 03 keep their own scale; they are lists and readouts, not
+// glanceable objects, and legibility beats drama there.
 static const lgfx::U8g2font fontBody (u8g2_font_helvR14_tf);
 static const lgfx::U8g2font fontLabel(u8g2_font_helvR10_tf);
-static const lgfx::U8g2font fontTiny (u8g2_font_helvR08_tf);
 
 // Palette. Warm-neutral, readable at low brightness.
 #define C_BG      0x0861      // near-black
@@ -175,11 +187,18 @@ static const lgfx::U8g2font fontTiny (u8g2_font_helvR08_tf);
 #define C_WARN    0xFC00      // amber
 #define C_GOOD    0x2E6B      // green
 
-// Hairline, between C_BG and C_PANEL. Structure without weight — the old page
-// had no rules at all, which is why five readings read as five fragments.
+// Hairline, between C_BG and C_PANEL. Three rules on the page, not five.
 #define C_RULE    0x2124
-// Chart track and the unfilled part of the attention bar.
+// Chart top gridline and the unfilled part of the attention bar.
 #define C_TRACK   0x10A2
+// A fourth text level below C_DIM, for the footer. C_DIM reads far brighter on
+// the panel than its numbers suggest, so "quiet" needed its own value rather
+// than a reuse — on hardware the old idle timer in C_DIM competed with the
+// clock while saying nothing.
+#define C_FAINT   0x5B0B
+// Muted accent for the six days that are not today. The hierarchy inside the
+// sparkline is carried entirely by this against C_ACCENT.
+#define C_ACCENT_DIM 0x1ACE
 
 // ═══════════════════════════════════════════════════ sensors
 
@@ -1276,69 +1295,82 @@ static void fmtHMS(uint32_t ms, char *out, size_t n) {
 }
 
 // The character face is gone, deliberately. It was a Phase 2 deliverable and
-// removing it is a reversal, not an oversight — on hardware it sat small in a
-// 296px band with ~85px of dead black either side of it, and it was the
-// smallest thing on a screen it was supposed to anchor. The space it held now
-// carries the week chart, which is information rather than decoration.
+// removing it is a reversal, not an oversight: on hardware it sat small in a
+// 296px band with roughly 85px of dead black either side of it.
 //
-// The degree sign below is emitted as UTF-8 ("\xC2\xB0", U+00B0). LovyanGFX
-// decodes UTF-8 by default and the _tf fonts carry the full Latin-1 range, so
-// this is real type — the earlier plan to fake it with a drawn ring was only
-// needed while the fonts stopped at ASCII.
+// This is the third layout, and the two failures before it are worth keeping
+// because they were opposite mistakes. The first kept every element at equal
+// weight behind identical hairlines — dense and unreadable, a content
+// inventory rather than a page. The second fixed the hierarchy by deleting
+// most of the content, which is not a fix, it is a different page.
+//
+// So: all of it, with a hierarchy. Four type levels far enough apart to read
+// as levels, one accent, three rules instead of five, and the session state
+// colouring the numbers it belongs to rather than a chip in a corner.
 
-// Compact duration for chart labels. A column is ~36px, so "1h 20m" does not
-// fit and the space is what goes.
+// Compact duration for chart labels and totals: "45m", "1h20", "2h". A column
+// is ~36px, so the space in "1h 20m" is what goes.
 static void fmtShort(long seconds, char *out, size_t n) {
-  long m = (seconds + 30) / 60;                  // to the nearest minute
+  long m = (seconds + 30) / 60;
   if (m < 60) { snprintf(out, n, "%ldm", m); return; }
   long h = m / 60, r = m % 60;
   if (r) snprintf(out, n, "%ldh%02ld", h, r);
   else   snprintf(out, n, "%ldh", h);
 }
 
-// The clock, drawn digit by digit into fixed-width cells.
+// Draw a proportional string as fixed-width cells so a number that changes
+// every second does not shuffle sideways. Digits are padded to the widest
+// digit; letters and punctuation keep their natural width, or "1h 47m" comes
+// out spaced like a ransom note.
 //
-// logisoso is a proportional face: '1' is far narrower than '8'. Drawn as one
-// string the whole time shifts sideways every minute and the colon wanders,
-// which on a clock you stare at all day is the difference between a product
-// and a prototype. Measuring the widest digit once and centring each glyph in
-// a cell of that width costs one loop.
-//
-// Returns the x just past the last glyph so the am/pm suffix can be placed
-// from the real extent rather than a guessed offset.
-static int drawClock(const char *s, int x, int y, uint16_t col) {
-  canvas.setFont(&fontClock);
-  canvas.setTextColor(col, C_BG);
-
+// Returns the x just past the last glyph, so a suffix can be placed from the
+// real extent rather than a guessed offset.
+// Widest digit in the current font. Both the draw and the measure below have
+// to agree on this or a right-aligned number lands in the wrong place.
+static int digitCellWidth() {
   int cell = 0;
   for (char d = '0'; d <= '9'; d++) {
     char one[2] = { d, '\0' };
     int w = canvas.textWidth(one);
     if (w > cell) cell = w;
   }
+  return cell;
+}
+
+// The width drawSteadyNumber will actually occupy — not textWidth(), which
+// measures the natural proportional advances. Padding every digit out to a
+// common cell can make the drawn string wider than measured, and for a
+// right-aligned number that difference walks it off the panel edge.
+static int steadyNumberWidth(const char *s) {
+  const int cell = digitCellWidth();
+  int total = 0;
+  for (const char *p = s; *p; p++) {
+    char one[2] = { *p, '\0' };
+    total += (*p >= '0' && *p <= '9') ? cell : canvas.textWidth(one);
+  }
+  return total;
+}
+
+static int drawSteadyNumber(const char *s, int x, int y, uint16_t col) {
+  canvas.setTextColor(col, C_BG);
+  const int cell = digitCellWidth();
 
   canvas.setTextDatum(middle_center);
   int cx = x;
   for (const char *p = s; *p; p++) {
     char one[2] = { *p, '\0' };
-    if (*p == ':' || *p == '-') {
-      // Punctuation keeps its natural width. Padded to a digit cell it leaves
-      // a visible hole on both sides.
+    if (*p >= '0' && *p <= '9') {
+      canvas.drawString(one, cx + cell / 2, y);
+      cx += cell;
+    } else {
       int w = canvas.textWidth(one);
       canvas.drawString(one, cx + w / 2, y);
       cx += w;
-    } else {
-      canvas.drawString(one, cx + cell / 2, y);
-      cx += cell;
     }
   }
   return cx;
 }
 
-// True when today has attention data worth a strip. Peeked separately from
-// drawAttentionBar because the chart needs to know its own height before
-// anything is drawn — on a day with no vision data the strip is not shown
-// dimmed, it is not shown at all, and the chart takes the space.
 static bool hasAttentionToday() {
   bool have; long total;
   STATS_TAKE();
@@ -1348,11 +1380,13 @@ static bool hasAttentionToday() {
   return have && total > 0;
 }
 
-// Seven-day focus chart, the same shape as the dashboard's and deliberately
-// so: both derive from session_daily() and they should agree at a glance.
+// Seven-day focus chart. Keeps its axis and its labels — this is the second
+// most important thing on the page and it can afford them.
 //
-// Only the peak and today carry a value label. Seven labels across 282px
-// collide, and the dashboard's chart made the same call for the same reason.
+// Only the peak and today carry a value label; seven would collide, and the
+// dashboard's chart made the same call for the same reason. Today's bar takes
+// the full accent and the rest are muted, which is the whole hierarchy this
+// element needs internally.
 static void drawWeekChart(int x, int y, int w, int h) {
   long days[STATS_DAYS], peak;
   bool have;
@@ -1362,19 +1396,16 @@ static void drawWeekChart(int x, int y, int w, int h) {
   have = statsFetched;
   STATS_GIVE();
 
-  canvas.setFont(&fontTiny);
-
   if (!have) {
-    // Never an empty chart on a failed fetch: a week of zero bars and a week
-    // that has not loaded look identical, and only one of them is true.
+    // Never an empty chart on a failed fetch: seven flat columns and a week
+    // with no work look identical, and only one of them is true.
+    canvas.setFont(&fontText);
     canvas.setTextDatum(middle_center);
-    canvas.setTextColor(C_DIM, C_BG);
+    canvas.setTextColor(C_FAINT, C_BG);
     canvas.drawString("waiting for the backend", x + w / 2, y + h / 2);
     return;
   }
 
-  // Round the scale up past the peak so the tallest bar never reaches the
-  // gridline and its label always has somewhere to sit.
   static const long steps[] = { 900, 1800, 3600, 5400, 7200, 10800, 14400, 21600 };
   long yMax = steps[0];
   for (size_t i = 0; i < sizeof(steps) / sizeof(steps[0]); i++) {
@@ -1385,18 +1416,19 @@ static void drawWeekChart(int x, int y, int w, int h) {
     yMax = ((peak / 3600) + 1) * 3600;
   }
 
-  const int gut    = 24;
-  const int plotX  = x + gut;
-  const int plotW  = w - gut;
-  const int top    = y + 10;                      // room for value labels
-  const int base   = y + h - 11;                  // room for day initials
-  const int plotH  = base - top;
-  if (plotH < 8 || plotW < 40) return;
+  const int gut   = 22;
+  const int plotX = x + gut;
+  const int plotW = w - gut;
+  const int top   = y + 9;                  // room for the value labels
+  const int base  = y + h - 10;             // room for the day initials
+  const int plotH = base - top;
+  if (plotH < 10 || plotW < 40) return;
 
   char buf[12];
 
+  canvas.setFont(&fontTiny);
   canvas.setTextDatum(middle_right);
-  canvas.setTextColor(C_DIM, C_BG);
+  canvas.setTextColor(C_FAINT, C_BG);
   fmtShort(yMax, buf, sizeof(buf));
   canvas.drawString(buf, plotX - 4, top);
   canvas.drawString("0", plotX - 4, base);
@@ -1409,8 +1441,6 @@ static void drawWeekChart(int x, int y, int w, int h) {
     if (peak > 0 && days[i] == peak) { peakIdx = i; break; }
   }
 
-  // Weekday initials ending on today. Derived from tm_wday rather than
-  // counted forward from a stored date, so it cannot drift.
   int wdayToday = -1;
   if (timeValid) {
     time_t now = time(nullptr);
@@ -1421,7 +1451,7 @@ static void drawWeekChart(int x, int y, int w, int h) {
   static const char *initials = "smtwtfs";
 
   const int cellW = plotW / STATS_DAYS;
-  int barW = cellW - 14;
+  int barW = cellW - 12;
   if (barW < 6) barW = 6;
 
   for (int i = 0; i < STATS_DAYS; i++) {
@@ -1431,20 +1461,17 @@ static void drawWeekChart(int x, int y, int w, int h) {
     int bh = 0;
     if (days[i] > 0) {
       bh = (int)((days[i] * (long)plotH) / yMax);
-      if (bh < 1) bh = 1;              // a worked minute must leave a mark
-      // Rounding the scale up past the peak keeps a bar off the gridline, but
-      // only just: a peak of 3599s against a 3600s scale is 99.9% of the plot
-      // and its own value label would sit above the top rule. Reserve the
-      // label's height outright rather than relying on the scale to do it.
-      if (bh > plotH - 9) bh = plotH - 9;
-      canvas.fillRect(cx - barW / 2, base - bh, barW, bh, C_ACCENT);
+      if (bh < 1) bh = 1;                   // a worked minute must leave a mark
+      if (bh > plotH - 8) bh = plotH - 8;   // always leave the label its room
+      canvas.fillRect(cx - barW / 2, base - bh, barW, bh,
+                      isToday ? C_ACCENT : C_ACCENT_DIM);
     }
 
     if (days[i] > 0 && (i == peakIdx || isToday)) {
       fmtShort(days[i], buf, sizeof(buf));
       canvas.setFont(&fontTiny);
       canvas.setTextDatum(bottom_center);
-      canvas.setTextColor(C_TEXT, C_BG);
+      canvas.setTextColor(isToday ? C_TEXT : C_DIM, C_BG);
       canvas.drawString(buf, cx, base - bh - 1);
     }
 
@@ -1453,19 +1480,16 @@ static void drawWeekChart(int x, int y, int w, int h) {
       char one[2] = { initials[wd], '\0' };
       canvas.setFont(&fontTiny);
       canvas.setTextDatum(top_center);
-      canvas.setTextColor(isToday ? C_TEXT : C_DIM, C_BG);
+      canvas.setTextColor(isToday ? C_TEXT : C_FAINT, C_BG);
       canvas.drawString(one, cx, base + 2);
     }
   }
 }
 
-// Today's attention as a part-to-whole across focused / distracted / away.
-// Only called when hasAttentionToday() already said there is something here.
-//
+// Today's attention, as a part-to-whole across focused / distracted / away.
 // The ratio counts focused against distracted and ignores time away, matching
-// focus_daily() and the dashboard: being out of the room is not a lapse in
-// attention, and a bathroom break should not read as one.
-static void drawAttentionBar(int x, int y, int w, int h) {
+// focus_daily() and the dashboard: being out of the room is not a lapse.
+static void drawAttentionBar(int x, int y, int w) {
   long foc, dis, away;
   int ratio;
   STATS_TAKE();
@@ -1475,30 +1499,29 @@ static void drawAttentionBar(int x, int y, int w, int h) {
   const long total = foc + dis + away;
   if (total <= 0) return;
 
-  const int midY = y + h / 2;
-
-  canvas.setFont(&fontLabel);
+  canvas.setFont(&fontTiny);
   canvas.setTextDatum(middle_left);
-  canvas.setTextColor(C_DIM, C_BG);
-  canvas.drawString("attention", x, midY);
+  canvas.setTextColor(C_FAINT, C_BG);
+  canvas.drawString("attention", x, y);
 
   char buf[8];
   snprintf(buf, sizeof(buf), "%d%%", ratio);
+  canvas.setFont(&fontText);
   canvas.setTextDatum(middle_right);
   canvas.setTextColor(C_TEXT, C_BG);
-  canvas.drawString(buf, x + w, midY);
+  canvas.drawString(buf, x + w, y);
   const int pctW = canvas.textWidth(buf);
 
-  const int barX = x + 56;
+  const int barX = x + 52;
   const int barW = (x + w - pctW - 8) - barX;
-  if (barW < 24) return;                 // no room for the bar; numbers stand
-  const int barH = 8, barY = midY - barH / 2;
+  if (barW < 24) return;
+  const int barH = 10, barY = y - barH / 2;
 
   canvas.fillRoundRect(barX, barY, barW, barH, barH / 2, C_TRACK);
 
   const int wf = (int)((foc * (long)barW) / total);
   const int wd = (int)((dis * (long)barW) / total);
-  const int wa = barW - wf - wd;          // remainder, so rounding cannot gap
+  const int wa = barW - wf - wd;            // remainder, so rounding cannot gap
 
   int cx = barX;
   if (wf > 0) { canvas.fillRect(cx, barY, wf, barH, C_GOOD); cx += wf; }
@@ -1506,191 +1529,168 @@ static void drawAttentionBar(int x, int y, int w, int h) {
   if (wa > 0) {  canvas.fillRect(cx, barY, wa, barH, C_DIM); }
 }
 
-// Page 01 — Home. Redesigned 2026-08-17, replacing the clock-and-face layout.
+// Page 01 — Home.
 //
-// Nothing on this page is accumulated on-device. The chart and the attention
-// bar are drawn straight from /api/stats/hub, which computes both in Postgres,
-// so §4 holds: the device still emits events and never totals.
+// Vertical budget for the 240px panel:
+//   6..50     time large left with pm and date beneath; session state and
+//             elapsed right, in the state colour
+//   58        rule
+//   62..88    five readings — temp, humidity, feels like, light, pressure
+//   94..170   week chart with axis, value labels and day initials
+//   176..190  attention bar, only when today has data
+//   194       rule
+//   198..214  tasks · wi-fi · camera
+//   232       page dots
 //
-// Vertical budget for the 240px panel, measured rather than guessed:
-//   0..64    clock + date left, session state + elapsed right, rule between
-//   66       hairline
-//   70..100  four readings — temp, humidity, feels like, light
-//   102      hairline
-//   105..    week chart, which grows into the attention strip's space when
-//            there is no attention data. That is most days: the vision page
-//            is a calibration tool, not an always-on tracker, and a strip
-//            permanently reading "no data" is a hole in the layout.
-//   199..217 attention strip, only when today has data
-//   218      hairline
-//   220..236 tasks · wi-fi · camera
-//   237      page dots, at the very bottom edge
-//
-// Pressure moved off this page. Five readings left ~64px each and forced the
-// labels down to a size you cannot read from a chair; four fit at 78px. It is
-// the least glanceable of the five, so it stays on Status.
+// Density is fine; uniformity was the problem. Four type levels (38 / 26 / 12
+// / 8), one accent for the bars, the state colour on the elapsed time and the
+// camera line, and C_FAINT for everything that is texture rather than news.
 static void pageHome() {
-  char buf[40];
+  char buf[64];
 
-  // ── clock, date, session ───────────────────────────────────────────────
-  bool isPM = false, haveTm = false;
+  const bool running = (timerState == T_RUNNING);
+  const bool paused  = (timerState == T_PAUSED);
+  const uint16_t stateCol = running ? C_GOOD : paused ? C_WARN : C_DIM;
+
+  // ── time, date, session ────────────────────────────────────────────────
   struct tm lt;
+  bool haveTm = false;
+  bool isPM = false;
 
   if (timeValid) {
     time_t now = time(nullptr);
     localtime_r(&now, &lt);
     haveTm = true;
-    int h12 = lt.tm_hour % 12;
-    if (h12 == 0) h12 = 12;              // midnight and noon are 12, not 0
     isPM = lt.tm_hour >= 12;
-    // No leading pad. drawClock holds every digit still in its own cell, so
-    // the block only changes width once a day going 9 -> 10, rather than
-    // sitting permanently indented behind a blank cell.
+    int h12 = lt.tm_hour % 12;
+    if (h12 == 0) h12 = 12;                 // midnight and noon are 12, not 0
     snprintf(buf, sizeof(buf), "%d:%02d", h12, lt.tm_min);
   } else {
     snprintf(buf, sizeof(buf), "--:--");
   }
 
-  const int clockEnd = drawClock(buf, 10, 32, timeValid ? C_TEXT : C_DIM);
+  canvas.setFont(&fontHero);
+  const int clockEnd = drawSteadyNumber(buf, 12, 28, haveTm ? C_TEXT : C_DIM);
 
-  canvas.setFont(&fontLabel);
+  canvas.setFont(&fontText);
   canvas.setTextColor(C_DIM, C_BG);
-
   if (haveTm) {
     canvas.setTextDatum(bottom_left);
-    canvas.drawString(isPM ? "pm" : "am", clockEnd + 5, 44);
+    canvas.drawString(isPM ? "pm" : "am", clockEnd + 5, 40);
 
     strftime(buf, sizeof(buf), "%a %d %b", &lt);
     for (char *p = buf; *p; p++) *p = (char)tolower((unsigned char)*p);
     canvas.setTextDatum(top_left);
-    canvas.drawString(buf, 11, 46);
+    canvas.drawString(buf, 13, 40);
   } else {
     canvas.setTextDatum(top_left);
-    canvas.drawString("waiting for ntp", 11, 46);
+    canvas.drawString("waiting for ntp", 13, 40);
   }
 
-  canvas.drawFastVLine(202, 8, 48, C_RULE);
+  canvas.setFont(&fontTiny);
+  canvas.setTextDatum(top_right);
+  canvas.setTextColor(stateCol, C_BG);
+  canvas.drawString(running ? "focusing" : paused ? "paused" : "idle", 308, 8);
 
-  canvas.setFont(&fontLabel);
-  canvas.setTextDatum(middle_right);
-  canvas.setTextColor(timerState == T_RUNNING ? C_GOOD
-                    : timerState == T_PAUSED  ? C_WARN : C_DIM, C_BG);
-  canvas.drawString(timerState == T_RUNNING ? "focus"
-                  : timerState == T_PAUSED  ? "paused" : "idle",
-                    SCREEN_W - 10, 17);
-
-  // m:ss under an hour, h:mm:ss beyond. A permanent leading "00:" spends the
-  // widest glyphs on the least information.
-  const uint32_t el = sessionElapsedMs() / 1000;
-  if (el >= 3600)
-    snprintf(buf, sizeof(buf), "%lu:%02lu:%02lu", (unsigned long)(el / 3600),
-             (unsigned long)((el / 60) % 60), (unsigned long)(el % 60));
-  else
-    snprintf(buf, sizeof(buf), "%lu:%02lu",
-             (unsigned long)(el / 60), (unsigned long)(el % 60));
-
+  fmtHMS(sessionElapsedMs(), buf, sizeof(buf));
   canvas.setFont(&fontTimer);
-  canvas.setTextDatum(middle_right);
-  canvas.setTextColor(timerState == T_IDLE ? C_DIM : C_TEXT, C_BG);
-  canvas.drawString(buf, SCREEN_W - 10, 43);
+  drawSteadyNumber(buf, 308 - steadyNumberWidth(buf), 34,
+                   (running || paused) ? stateCol : C_FAINT);
+
+  canvas.drawFastHLine(0, 58, SCREEN_W, C_RULE);
 
   // ── readings ───────────────────────────────────────────────────────────
-  canvas.drawFastHLine(0, 66, SCREEN_W, C_RULE);
-
-  static const int   colX[4]     = { 11, 89, 167, 245 };
-  static const char *colLabel[4] = { "temp", "humidity", "feels like", "light" };
-  char colVal[4][16];
+  // Five of them, as you asked. Value-forward with faint labels above, so the
+  // row reads as data rather than as a form to fill in.
+  static const int   colX[5]     = { 12, 74, 136, 198, 258 };
+  static const char *colLabel[5] = { "temp", "humidity", "feels", "light", "pressure" };
+  char colVal[5][14];
 
   if (hasTemp)     snprintf(colVal[0], sizeof(colVal[0]), "%.1f\xC2\xB0", tempC);
   else             snprintf(colVal[0], sizeof(colVal[0]), "--");
-
   if (hasHumidity) snprintf(colVal[1], sizeof(colVal[1]), "%.0f%%", humidity);
   else             snprintf(colVal[1], sizeof(colVal[1]), "--");
-
-  if (hasHumidity) snprintf(colVal[2], sizeof(colVal[2]), "%.1f\xC2\xB0", realFeelC);
+  if (hasHumidity) snprintf(colVal[2], sizeof(colVal[2]), "%.0f\xC2\xB0", realFeelC);
   else             snprintf(colVal[2], sizeof(colVal[2]), "--");
-
   if (!luxOk)         snprintf(colVal[3], sizeof(colVal[3]), "--");
-  // Four digits of lux would run into the next column, and above 999 the exact
-  // figure has stopped meaning anything to a person looking at a desk.
   else if (lux > 999) snprintf(colVal[3], sizeof(colVal[3]), "999+");
   else                snprintf(colVal[3], sizeof(colVal[3]), "%.0f", lux);
+  if (hasPressure) snprintf(colVal[4], sizeof(colVal[4]), "%.0f", pressHpa);
+  else             snprintf(colVal[4], sizeof(colVal[4]), "--");
 
-  const bool colOk[4] = { hasTemp, hasHumidity, hasHumidity, luxOk };
+  const bool colOk[5] = { hasTemp, hasHumidity, hasHumidity, luxOk, hasPressure };
 
-  for (int i = 0; i < 4; i++) {
-    canvas.setFont(&fontLabel);
+  for (int i = 0; i < 5; i++) {
+    canvas.setFont(&fontTiny);
     canvas.setTextDatum(top_left);
-    canvas.setTextColor(C_DIM, C_BG);
-    canvas.drawString(colLabel[i], colX[i], 70);
+    canvas.setTextColor(C_FAINT, C_BG);
+    canvas.drawString(colLabel[i], colX[i], 64);
 
-    canvas.setFont(&fontValue);
+    canvas.setFont(&fontText);
     canvas.setTextDatum(top_left);
-    canvas.setTextColor(colOk[i] ? C_TEXT : C_DIM, C_BG);
-    canvas.drawString(colVal[i], colX[i], 84);
+    canvas.setTextColor(colOk[i] ? C_TEXT : C_FAINT, C_BG);
+    canvas.drawString(colVal[i], colX[i], 74);
   }
 
-  canvas.drawFastHLine(0, 102, SCREEN_W, C_RULE);
-
-  // ── week chart, plus attention when today has any ──────────────────────
+  // ── week chart, and attention when today has any ───────────────────────
   const bool attn = hasAttentionToday();
-  drawWeekChart(6, 105, SCREEN_W - 12, attn ? 92 : 111);
-  if (attn) drawAttentionBar(11, 199, SCREEN_W - 22, 18);
+  drawWeekChart(6, 94, SCREEN_W - 12, attn ? 76 : 94);
+  if (attn) drawAttentionBar(12, 183, SCREEN_W - 24);
 
-  // ── bottom row ─────────────────────────────────────────────────────────
-  canvas.drawFastHLine(0, 218, SCREEN_W, C_RULE);
+  canvas.drawFastHLine(0, 194, SCREEN_W, C_RULE);
 
+  // ── tasks · wi-fi · camera ─────────────────────────────────────────────
   TODO_TAKE();
   const int  remaining = todoCount;
   const bool fetched   = todosFetched;
   TODO_GIVE();
 
-  canvas.setFont(&fontLabel);
+  canvas.setFont(&fontText);
   canvas.setTextDatum(middle_left);
-  canvas.setTextColor(remaining ? C_TEXT : C_DIM, C_BG);
+  canvas.setTextColor(remaining ? C_DIM : C_FAINT, C_BG);
   if (!fetched) snprintf(buf, sizeof(buf), "tasks ...");
   else          snprintf(buf, sizeof(buf), "%d task%s",
                          remaining, remaining == 1 ? "" : "s");
-  canvas.drawString(buf, 11, 228);
+  canvas.drawString(buf, 12, 206);
 
-  canvas.drawFastVLine(106, 221, 14, C_RULE);
-  canvas.drawFastVLine(212, 221, 14, C_RULE);
+  canvas.drawFastVLine(104, 199, 14, C_RULE);
+  canvas.drawFastVLine(208, 199, 14, C_RULE);
 
   canvas.setTextDatum(middle_left);
   if (netState == NET_UP) {
     snprintf(buf, sizeof(buf), "wifi %d", WiFi.RSSI());
-    canvas.setTextColor(C_DIM, C_BG);
+    canvas.setTextColor(C_FAINT, C_BG);
   } else if (netState == NET_CONNECTING) {
-    snprintf(buf, sizeof(buf), "wifi ...");
+    snprintf(buf, sizeof(buf), "connecting");
     canvas.setTextColor(C_WARN, C_BG);
   } else {
     snprintf(buf, sizeof(buf), "no wifi");
     canvas.setTextColor(C_WARN, C_BG);
   }
-  canvas.drawString(buf, 118, 228);
+  canvas.drawString(buf, 116, 206);
 
-  // Camera. Amber only while a session is running with nothing watching —
-  // an unopened /vision tab is the normal resting state, not a fault, and a
+  // Camera. Amber only while a session runs with nothing watching — an
+  // unopened /vision tab is the normal resting state, not a fault, and a
   // warning colour permanently lit is how a screen teaches you to ignore it.
   const char *camText;
   uint16_t    camCol;
   if (!camOnline) {
     camText = camLastOk ? "cam lost" : "standalone";
-    camCol  = camLastOk ? C_WARN : C_DIM;
+    camCol  = camLastOk ? C_WARN : C_FAINT;
   } else if (!camViewer) {
     camText = "no viewer";
-    camCol  = (timerState == T_RUNNING) ? C_WARN : C_DIM;
-  } else if (timerState == T_RUNNING) {
+    camCol  = running ? C_WARN : C_FAINT;
+  } else if (running) {
     camText = "tracking";
     camCol  = C_GOOD;
   } else {
     camText = "vision ready";
-    camCol  = C_DIM;
+    camCol  = C_FAINT;
   }
 
   canvas.setTextDatum(middle_right);
   canvas.setTextColor(camCol, C_BG);
-  canvas.drawString(camText, SCREEN_W - 10, 228);
+  canvas.drawString(camText, SCREEN_W - 12, 206);
 }
 
 // Page 02 — Tasks. Layout unchanged by the redesign; the contents now come
