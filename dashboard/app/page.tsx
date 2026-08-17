@@ -51,8 +51,17 @@ function num(v: unknown): number {
 
 type Day = { day: string; focus_seconds: number; session_count: number };
 
+type Attention = {
+  focused: number;
+  distracted: number;
+  absent: number;
+  longest: number;
+  breaks: number;
+  ratio: number;
+};
+
 async function load() {
-  const [todayRows, dailyRows, stretchRows, readingRows, todoRows] =
+  const [todayRows, dailyRows, stretchRows, readingRows, todoRows, focusRows] =
     await Promise.all([
       sql`select (now() at time zone ${TZ})::date::text as today`,
       sql`
@@ -78,6 +87,17 @@ async function load() {
         from todos
         order by done asc, position asc, updated_at asc
         limit 200`,
+      // day::text for the same reason as everywhere else — a bare date comes
+      // back as a JS Date resolved in the server's timezone.
+      sql`
+        select day::text as day, focused_seconds, distracted_seconds,
+               absent_seconds, longest_focus_s, distraction_events, focus_ratio
+        from focus_daily(
+          ${DEVICE_ID},
+          (now() at time zone ${TZ})::date,
+          (now() at time zone ${TZ})::date,
+          ${TZ}
+        )`,
     ]);
 
   const today = String(todayRows[0].today);
@@ -98,6 +118,20 @@ async function load() {
     days,
     longestToday: num(stretchRows[0]?.longest_seconds),
     reading: readingRows[0] ?? null,
+    // Null when the vision page has not run today. That is the honest state:
+    // it is a calibration tool, not an always-on tracker, so most days will
+    // have no attention data at all and the card says so rather than
+    // rendering an empty chart.
+    attention: focusRows[0]
+      ? ({
+          focused: num(focusRows[0].focused_seconds),
+          distracted: num(focusRows[0].distracted_seconds),
+          absent: num(focusRows[0].absent_seconds),
+          longest: num(focusRows[0].longest_focus_s),
+          breaks: num(focusRows[0].distraction_events),
+          ratio: num(focusRows[0].focus_ratio),
+        } as Attention)
+      : null,
     todos: todoRows.map<Todo>((r) => ({
       id: String(r.id),
       title: String(r.title),
@@ -350,10 +384,76 @@ function EnvRow({
   );
 }
 
+// Part-to-whole across three states, so a single stacked bar rather than
+// three. These carry the status palette rather than categorical hues because
+// they genuinely are states with a valence — and each ships with a label, so
+// colour is never the only channel.
+function AttentionCard({ a }: { a: Attention | null }) {
+  if (!a || a.focused + a.distracted + a.absent === 0) {
+    return (
+      <p className="text-sm" style={{ color: "var(--text-muted)" }}>
+        No attention data today. It is recorded while the camera board&apos;s{" "}
+        <code className="text-xs">/vision</code> page is open.
+      </p>
+    );
+  }
+
+  const total = a.focused + a.distracted + a.absent;
+  const parts = [
+    { k: "Focused", v: a.focused, c: "var(--status-good)" },
+    { k: "Distracted", v: a.distracted, c: "var(--status-warning)" },
+    { k: "Away", v: a.absent, c: "var(--text-muted)" },
+  ].filter((p) => p.v > 0);
+
+  return (
+    <div>
+      <div className="grid grid-cols-3 gap-4">
+        <Stat label="Focus ratio" value={`${Math.round(a.ratio * 100)}%`} />
+        <Stat label="Longest focus" value={fmtDuration(a.longest)} />
+        <Stat label="Breaks" value={String(a.breaks)} />
+      </div>
+
+      {/* 2px surface gaps separate the segments — a gap, not a border. */}
+      <div className="mt-4 flex h-2.5 w-full overflow-hidden rounded-full">
+        {parts.map((p, i) => (
+          <div
+            key={p.k}
+            title={`${p.k} — ${fmtDuration(p.v)}`}
+            style={{
+              width: `${(p.v / total) * 100}%`,
+              background: p.c,
+              marginLeft: i === 0 ? 0 : 2,
+            }}
+          />
+        ))}
+      </div>
+
+      <div className="mt-3 flex flex-wrap gap-x-4 gap-y-1">
+        {parts.map((p) => (
+          <span key={p.k} className="flex items-center gap-1.5 text-xs">
+            <span
+              aria-hidden
+              className="inline-block h-2 w-2 rounded-full"
+              style={{ background: p.c }}
+            />
+            <span style={{ color: "var(--text-secondary)" }}>{p.k}</span>
+            <span style={{ color: "var(--text-muted)" }}>{fmtDuration(p.v)}</span>
+          </span>
+        ))}
+      </div>
+
+      <p className="mt-3 text-xs" style={{ color: "var(--text-muted)" }}>
+        Focus ratio counts focused against distracted, ignoring time away — being
+        out of the room is not a lapse in attention.
+      </p>
+    </div>
+  );
+}
+
 // ── page ─────────────────────────────────────────────────────────────────
 
 export default async function Home() {
-  const { today, days, longestToday, reading, todos } = await load();
+  const { today, days, longestToday, reading, todos, attention } = await load();
 
   const todayRow = days.find((d) => d.day === today);
   const todaySeconds = todayRow?.focus_seconds ?? 0;
@@ -438,6 +538,10 @@ export default async function Home() {
             </tbody>
           </table>
         </details>
+      </Card>
+
+      <Card title="Attention — today" className="mb-5">
+        <AttentionCard a={attention} />
       </Card>
 
       <div className="grid gap-5 md:grid-cols-2">

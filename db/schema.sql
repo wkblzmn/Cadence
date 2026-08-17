@@ -243,6 +243,116 @@ select
 from session_segments()
 group by device_id, day;
 
+-- ── 2e. Attention (spec §8, vision tier) ─────────────────────────────────
+--
+-- focus_samples is a series of states, one every couple of seconds while the
+-- vision page is open. The interesting quantities are not counts of samples
+-- but *runs* of them: how long attention was held unbroken, and how often it
+-- broke. So collapse consecutive same-state samples into islands first.
+--
+-- Two things break a run, and both matter:
+--   1. The state changing. Obvious.
+--   2. A gap in the samples. The vision page is a calibration tool, not an
+--      always-on tracker, so it stops when the tab does — and without this
+--      guard a run would silently span the hours it was closed and report a
+--      four-hour unbroken focus that never happened.
+
+create or replace function focus_islands(
+  p_device_id text,
+  p_tz        text default 'Asia/Dhaka',
+  p_max_gap   interval default interval '10 seconds'
+)
+returns table (
+  day        date,
+  state      text,
+  started_at timestamptz,
+  ended_at   timestamptz,
+  samples    bigint
+)
+language sql
+stable
+as $$
+  with ordered as (
+    select ts, state,
+           lag(ts)    over (order by ts) as prev_ts,
+           lag(state) over (order by ts) as prev_state
+    from focus_samples
+    where device_id = p_device_id
+  ),
+  marked as (
+    select ts, state,
+           case
+             when prev_ts is null                      then 1
+             when prev_state is distinct from state    then 1
+             when ts - prev_ts > p_max_gap             then 1
+             else 0
+           end as breaks
+    from ordered
+  ),
+  islands as (
+    select ts, state, sum(breaks) over (order by ts) as island
+    from marked
+  )
+  select
+    (min(ts) at time zone p_tz)::date as day,
+    state,
+    min(ts) as started_at,
+    max(ts) as ended_at,
+    count(*)::bigint as samples
+  from islands
+  group by island, state
+  order by 3;
+$$;
+
+-- Per-day attention summary. Seconds come from the island spans rather than
+-- multiplying a sample count by an assumed interval — the page's sampling
+-- rate is a tunable, and a number derived from it would quietly go wrong the
+-- first time somebody changes it.
+create or replace function focus_daily(
+  p_device_id text,
+  p_from      date,
+  p_to        date,
+  p_tz        text default 'Asia/Dhaka'
+)
+returns table (
+  day                date,
+  focused_seconds    bigint,
+  distracted_seconds bigint,
+  absent_seconds     bigint,
+  longest_focus_s    bigint,
+  distraction_events bigint,
+  focus_ratio        real
+)
+language sql
+stable
+as $$
+  with i as (
+    select *, extract(epoch from (ended_at - started_at)) as secs
+    from focus_islands(p_device_id, p_tz)
+    where (started_at at time zone p_tz)::date between p_from and p_to
+  ),
+  agg as (
+    select
+      day,
+      coalesce(sum(secs) filter (where state = 'focused'),    0)::bigint as f,
+      coalesce(sum(secs) filter (where state = 'distracted'), 0)::bigint as d,
+      coalesce(sum(secs) filter (where state = 'absent'),     0)::bigint as a,
+      coalesce(max(secs) filter (where state = 'focused'),    0)::bigint as longest,
+      -- Every distracted island is one break in attention, however long it
+      -- lasted. Ten seconds away and ten minutes away are both one lapse;
+      -- their duration is already counted separately above.
+      count(*) filter (where state = 'distracted')::bigint as breaks
+    from i
+    group by day
+  )
+  select
+    day, f, d, a, longest, breaks,
+    case when (f + d) > 0 then (f::real / (f + d)) else 0 end as focus_ratio
+  from agg
+  order by day;
+$$;
+
+
 create or replace view readings_latest as
 select distinct on (device_id) *
 from readings
