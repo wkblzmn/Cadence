@@ -51,6 +51,7 @@ static const char VISION_PAGE[] PROGMEM = R"HTMLPAGE(
     <div class="row"><span class="k">gaze</span><span class="v" id="gaze">-</span></div>
     <div class="row"><span class="k">eyes</span><span class="v" id="eyes">-</span></div>
     <div class="row"><span class="k">inference</span><span class="v" id="ms">-</span></div>
+    <div class="row"><span class="k">tick rate</span><span class="v" id="rate">-</span></div>
     <div class="row"><span class="k">samples sent</span><span class="v" id="sent">0</span></div>
     <div class="row"><span class="k">last post</span><span class="v" id="post">-</span></div>
     <button id="cal">Calibrate centre</button>
@@ -82,12 +83,15 @@ const PITCH_LIMIT = parseFloat(P.get("pitch") ?? "0.28");
 const GAZE_LIMIT  = parseFloat(P.get("gaze")  ?? "0.35");  // blendshape score
 const HZ          = parseFloat(P.get("hz")    ?? "4");     // inference rate
 const WINDOW_MS   = parseInt  (P.get("window")?? "2000");  // one sample per window
+const POST_MS     = parseInt  (P.get("post")  ?? "10000"); // batch upload interval
 
 // The stream is on port 81; this page is served from port 80 on the same host.
 img.src = `http://${location.hostname}:81/stream`;
 
 let landmarker = null, centre = null, sent = 0, lastGaze = 0;
 const votes = [];
+const pending = [];
+let tickCount = 0, rateAt = performance.now();
 
 try {
   const fileset = await FilesetResolver.forVisionTasks(
@@ -182,6 +186,7 @@ function tick() {
   catch (e) { $("err").textContent = "detect: " + e.message; return; }
   const dt = performance.now() - t0;
 
+  tickCount++;
   const r = classify(res);
   lastLm = res?.faceLandmarks?.[0] ?? null;
   votes.push(r.state);
@@ -193,6 +198,15 @@ function tick() {
   $("gaze").textContent  = r.gaze  === undefined || r.gaze === null ? "-" : r.gaze.toFixed(2);
   $("eyes").textContent  = r.eyes  === null ? "-" : r.eyes.toFixed(2);
   $("ms").textContent    = dt.toFixed(0) + " ms";
+
+  // Measured, not assumed. Background this tab for a few minutes and come
+  // back: if this collapsed, the audio exemption is not holding.
+  const now = performance.now();
+  if (now - rateAt >= 5000) {
+    const hz = tickCount / ((now - rateAt) / 1000);
+    $("rate").textContent = hz.toFixed(2) + "/s" + (document.hidden ? " (hidden)" : "");
+    tickCount = 0; rateAt = now;
+  }
 
   if (lastLm) {
     ctx.fillStyle = r.state === "focused" ? "#0ca30c" : "#fab219";
@@ -215,21 +229,37 @@ async function flush() {
   const conf = tally[state] / votes.length;
   votes.length = 0;
 
-  const body = { samples: [{ ts: new Date().toISOString(), state, confidence: conf }] };
+  pending.push({ ts: new Date().toISOString(), state, confidence: conf });
+}
+
+// Post in batches rather than one sample at a time.
+//
+// Every POST costs the board a TLS handshake, and one per 2 s window was
+// slower than the windows arrived — its queue backed up and dropped samples,
+// which is why roughly a third went missing. The ingest route takes up to 500
+// samples per call and always did; it was built for this.
+async function post() {
+  if (pending.length === 0) return;
+  const batch = pending.splice(0, 100);
   try {
     const r = await fetch("/focus", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
+      body: JSON.stringify({ samples: batch }),
     });
     $("post").textContent = r.ok ? "ok" : "HTTP " + r.status;
-    if (r.ok) $("sent").textContent = ++sent;
+    if (r.ok) { sent += batch.length; $("sent").textContent = sent; }
+    // A failed batch goes back to the front, so a transient error costs a
+    // delay rather than the samples themselves.
+    else pending.unshift(...batch);
   } catch (e) {
     $("post").textContent = "failed";
+    pending.unshift(...batch);
   }
 }
 
 setInterval(tick, Math.max(60, 1000 / HZ));
 setInterval(flush, WINDOW_MS);
+setInterval(post, POST_MS);
 </script>
 )HTMLPAGE";
