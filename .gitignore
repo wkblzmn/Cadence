@@ -28,6 +28,10 @@ firmware/**/build/
 *.bin
 *.map
 
+# ── hardware / enclosure ─────────────────────────────────────────────────
+# Enclosure design and print files. Kept local.
+hardware/
+
 # ── editors / OS ─────────────────────────────────────────────────────────
 .vscode/
 .idea/
