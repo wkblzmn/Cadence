@@ -259,12 +259,10 @@ def post_batch(host, batch, timeout=10.0):
 def run(host, free_run=False, verbose=False):
     centre = load_calibration()
     if centre:
-        print(f"calibration: yaw {centre['yaw']:+.3f}  pitch {centre['pitch']:+.3f}  "
-              f"gaze {centre['gaze']:.3f}")
+        log(f"calibration: yaw {centre['yaw']:+.3f}  pitch {centre['pitch']:+.3f}  "
+            f"gaze {centre['gaze']:.3f}")
     else:
-        print("no calibration found — run with --calibrate. Until then a screen "
-              "below eye level will read as a permanent downward look and "
-              "everything will come back distracted.")
+        log("NO CALIBRATION — run --calibrate. Until then everything reads distracted.")
 
     landmarker = make_landmarker()
 
@@ -339,8 +337,8 @@ def run(host, free_run=False, verbose=False):
                 last_window = now
                 if votes:
                     s = flush_window(votes, pending)
-                    print(f"{datetime.now().strftime('%H:%M:%S')}  {s['state']:11} "
-                          f"conf {s['confidence']:.2f}  queued {len(pending)}")
+                    log(f"{s['state']:11} conf {s['confidence']:.2f}  "
+                        f"queued {len(pending)}")
 
             if now - last_post >= POST_S:
                 last_post = now
@@ -420,9 +418,9 @@ def drain(host, pending):
     del pending[:len(batch)]
     code, body = post_batch(host, batch)
     if code and 200 <= code < 300:
-        print(f"  posted {len(batch)} -> HTTP {code}")
+        log(f"posted {len(batch)} -> HTTP {code}")
         return len(batch)
-    print(f"  post failed ({code}: {body}); requeued {len(batch)}")
+    log(f"post failed ({code}: {body}); requeued {len(batch)}")
     pending[:0] = batch
     return 0
 
