@@ -51,6 +51,12 @@ typedef struct __attribute__((packed)) {
 static bool     nowReady   = false;
 static uint32_t nowSeq     = 0;
 static uint32_t nowRxCount = 0;
+static bool     nowLocked  = false;
+
+// Consecutive Wi-Fi failures before we stop chasing it. Six is long enough
+// that a router rebooting at home does not trip it, short enough that a
+// demonstration settles within a couple of minutes of being switched on.
+#define CADENCE_NOW_GIVEUP 6
 
 // Both sketches define both of these; each implements the one it cares about
 // and leaves the other empty. Simpler than making the header conditional, and
@@ -103,6 +109,26 @@ static bool cadenceNowBegin(bool receiver) {
   Serial.printf("ESP-NOW : ready on channel %d, %s\n",
                 WiFi.channel(), receiver ? "listening" : "sending");
   return true;
+}
+
+// Stop the STA wandering, and nail the radio to the ESP-NOW channel.
+//
+// Away from a known network both boards retry Wi-Fi forever, and every attempt
+// makes the STA scan — which moves the radio off channel and drops ESP-NOW
+// traffic in both directions for the duration. The two boards scan on their own
+// schedules, so the link degrades precisely where it is the only link there is.
+//
+// Called after enough consecutive failures to be sure there is nothing to join.
+// It does not erase the credentials, so a power cycle goes back to trying.
+static void cadenceNowLockChannel() {
+  if (nowLocked) return;
+  WiFi.disconnect(true, false);
+  esp_wifi_set_promiscuous(true);
+  esp_wifi_set_channel(CADENCE_NOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
+  esp_wifi_set_promiscuous(false);
+  nowLocked = true;
+  Serial.printf("ESP-NOW : no Wi-Fi to join - locked to channel %d, "
+                "radio is ESP-NOW only until reboot\n", CADENCE_NOW_CHANNEL);
 }
 
 static void cadenceNowSend(uint8_t type, uint8_t state, uint8_t flags) {

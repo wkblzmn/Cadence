@@ -925,11 +925,19 @@ void loop() {
   }
 
   static uint32_t lastCheck = 0;
+  static uint8_t  wifiFails = 0;
   if (millis() - lastCheck > 10000) {
     lastCheck = millis();
-    if (WiFi.status() != WL_CONNECTED) {
+    if (WiFi.status() == WL_CONNECTED) {
+      wifiFails = 0;
+    } else if (wifiFails < CADENCE_NOW_GIVEUP) {
+      wifiFails++;
       USBLOG("[WIFI] link lost, reconnecting");
       WiFi.reconnect();
+    } else {
+      // Nothing to join. Stop scanning and leave the radio where ESP-NOW can
+      // use it; the cable does not need a network and neither does the hub link.
+      cadenceNowLockChannel();
     }
   }
 }

@@ -451,6 +451,10 @@ static void netService() {
 
   switch (netState) {
     case NET_DOWN:
+      // Past the give-up count there is nothing to join, and every further
+      // attempt costs an ESP-NOW outage while the STA scans. The camera link
+      // matters more than a network that is not there.
+      if (netRetryCount >= CADENCE_NOW_GIVEUP) { cadenceNowLockChannel(); break; }
       if (now - netRetryMs >= min((uint32_t)NET_RETRY_MAX,
                                   (uint32_t)(NET_RETRY_BASE * (netRetryCount + 1))))
         netBegin();
