@@ -41,11 +41,18 @@ ehthumbs.db
 Desktop.ini
 $RECYCLE.BIN/
 .DS_Store
-# ── vision host ──────────────────────────────────────────────────────────
+# ── the app ──────────────────────────────────────────────────────────────
 # The Face Landmarker model is ~3.7 MB of redistributable binary and the
 # calibration is per-desk, per-chair. Neither belongs in the repo.
-vision/face_landmarker.task
-vision/calibration.json
-vision/__pycache__/
-vision/host.log
-vision/host.log.1
+app/face_landmarker.task
+app/calibration.json
+app/__pycache__/
+app/cadence/__pycache__/
+app/cadence.log
+app/cadence.log.1
+# The API token, the unsent sample spool, and which COM port answered last.
+# All three are per-machine, and the first is a secret.
+app/backend.json
+app/spool.json
+app/spool.json.tmp
+app/serial_port.json

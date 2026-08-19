@@ -46,6 +46,7 @@
 // ever jumps by hundreds of KB, that is the setting to check first.
 #include <U8g2lib.h>
 #include "secrets.h"
+#include "espnow_sync.h"
 
 // Where the camera board lives. Defaulted here rather than required in
 // secrets.h so an existing secrets.h from before the vision tier still
@@ -1049,6 +1050,10 @@ static volatile uint8_t camWantState = 0;   // 0 idle · 1 running · 2 paused
 static volatile bool    camDirty     = false;
 
 bool     camOnline     = false;
+// When the radio last heard from the camera. Separate from camLastOk, which
+// HTTP also writes: the HTTP failure path must be able to ask "is the other
+// road still up?" without answering its own question.
+uint32_t camRadioAt    = 0;
 bool     camViewer     = false;    // something is pulling the stream
 uint32_t camLastOk     = 0;
 int      camLastStatus = 0;
@@ -1060,9 +1065,33 @@ static const char *camStateName(uint8_t s) {
 // Called from loop() on core 1. Records the intent and returns immediately —
 // the request itself happens on netTask, for the same reason every other
 // request does.
+// The hub implements this one; the session callback is the camera's job.
+void cadenceNowOnSession(uint8_t) {}
+
+// The camera, heard directly over the radio. This is what makes the camera
+// tracker work with no network: camOnline and camViewer used to be set from
+// the HTTP response to camPushSession, and that request is the first thing to
+// fail off-network — leaving the tracker reading offline for a camera that is
+// sitting right there, working.
+//
+// Deliberately does not touch camLastStatus, which means "what did HTTP say".
+// Conflating the two would hide which road is actually up.
+void cadenceNowOnCamStatus(uint8_t, uint8_t flags) {
+  camOnline  = true;
+  camLastOk  = millis();
+  camRadioAt = millis();
+  camViewer = (flags & CADENCE_NOW_F_STREAMING) != 0;
+}
+
 static void camNotify(uint8_t state) {
   camWantState = state;
   camDirty     = true;
+
+  // Straight out over the radio as well, and from this function rather than
+  // from netTask, because ESP-NOW does not need the network to be up and must
+  // not be made to wait for it. The HTTP push stays: where a network exists it
+  // still works, and two roads to the same board is the point.
+  cadenceNowSend(CADENCE_NOW_SESSION, state, 0);
 }
 
 // `announce` is set when this push carries an actual state change rather than
@@ -1073,7 +1102,13 @@ static void camPushSession(bool announce) {
              + camStateName(camWantState);
 
   HTTPClient http;
-  if (!httpBegin(http, url)) { camOnline = false; camViewer = false; return; }
+  // A failed HTTP push says nothing about the camera when the radio is still
+  // hearing it every two seconds — which is the normal case off-network, and
+  // the case this whole device is being carried into.
+  if (!httpBegin(http, url)) {
+    if (millis() - camRadioAt > 10000UL) { camOnline = false; camViewer = false; }
+    return;
+  }
 
   // Tighter than httpBegin's defaults, which are sized for a TLS handshake to
   // Vercel. This is a LAN GET to a device that either answers in milliseconds
@@ -1088,15 +1123,19 @@ static void camPushSession(bool announce) {
 
   bool wasOnline = camOnline;
   camLastStatus  = status;
-  camOnline      = (status >= 200 && status < 300);
+  bool httpOk    = (status >= 200 && status < 300);
+  camOnline      = httpOk || (millis() - camRadioAt <= 10000UL);
 
-  if (camOnline) {
+  // Only HTTP may read HTTP's answer. When camOnline is true because the radio
+  // said so, `resp` is empty, and parsing it would report "no viewer" for a
+  // camera the radio just told us is streaming.
+  if (httpOk) {
     camLastOk = millis();
     // Scanned, not parsed. One boolean out of a response this project also
     // writes does not justify a parser; the hand-rolled one used for todos
     // exists only because todo titles are arbitrary user text.
     camViewer = resp.indexOf("\"viewer\":true") >= 0;
-  } else {
+  } else if (!camOnline) {
     camViewer = false;
   }
 
@@ -1130,6 +1169,20 @@ static void netTask(void *) {
   uint32_t lastCamPush = 0;
 
   netBegin();          // first attempt immediately; retries are handled below
+
+  // ESP-NOW starts HERE, and not in setup(), which is where it was and where it
+  // panicked: LoadProhibited on core 1, a null dereference at 0x4c.
+  //
+  // esp_now_init() needs the Wi-Fi driver already started, and on this board
+  // the driver is started by netBegin() above — on core 0, from this task,
+  // which setup() creates and then immediately runs past. Calling it from
+  // setup() therefore did two wrong things at once: it ran before
+  // WiFi.mode(WIFI_STA) had initialised anything, and it raced this task while
+  // it was initialising.
+  //
+  // It stays outside any NET_UP check. It needs the driver, not an association
+  // — which is the entire point of using ESP-NOW for this link.
+  cadenceNowBegin(false);
 
   for (;;) {
     netService();
@@ -2030,6 +2083,17 @@ void setup() {
 }
 
 void loop() {
+  // Re-announce the session over the radio. The camera expires a session it
+  // has not heard about in SESSION_TTL_MS (90 s), and broadcast ESP-NOW is
+  // unacknowledged, so a single dropped packet must not be able to stop a
+  // recording. Same 30 s cadence as the HTTP heartbeat, but outside the
+  // NET_UP gate that one sits behind.
+  static uint32_t lastNowPush = 0;
+  if (millis() - lastNowPush >= 30000UL) {
+    lastNowPush = millis();
+    cadenceNowSend(CADENCE_NOW_SESSION, camWantState, 0);
+  }
+
   static uint32_t lastFrame = 0;
 
   // Networking lives in netTask on core 0. Nothing blocking belongs here.

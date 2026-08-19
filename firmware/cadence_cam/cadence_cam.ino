@@ -33,6 +33,8 @@
 #include <WiFiClientSecure.h>
 #include "secrets.h"
 #include "vision_page.h"
+#include "usb_stream.h"
+#include "espnow_sync.h"
 
 // ═══════════════════════════════════════════════════ pins (07_bringup_camera)
 
@@ -535,6 +537,28 @@ static const char *sessionName(uint8_t s) {
   return s == 1 ? "running" : s == 2 ? "paused" : "idle";
 }
 
+// Applies a session state that arrived over ESP-NOW.
+//
+// Identical to what handleSession() does with ?state=, and deliberately so:
+// the two are the same fact arriving by different roads, and the TTL refresh
+// has to happen on both or a session held up only by radio packets would
+// expire after ninety seconds.
+// The camera implements this one; the status callback is the hub's job.
+void cadenceNowOnCamStatus(uint8_t, uint8_t) {}
+
+void cadenceNowOnSession(uint8_t state) {
+  uint8_t was = sessionState;
+  sessionHeardAt = millis();     // timestamp before state; see handleSession()
+  sessionState   = state;
+
+  // Tell the PC down the cable. Over USB there is no /session to poll, so this
+  // is the only way the button on the desk reaches the app. Announced on change
+  // only, and not suppressed while streaming: a text line lands inside at most
+  // one frame, which fails its CRC and is dropped, and losing one frame out of
+  // a session is a fair price for the press being acted on immediately.
+  if (state != was) Serial.printf("#SESSION %s\n", sessionName(state));
+}
+
 // The state with the TTL applied. Every reader goes through this rather than
 // touching sessionState, so a stale "running" cannot be observed anywhere.
 static uint8_t sessionNow() {
@@ -744,7 +768,7 @@ static void streamTask(void *) {
       streamClient = incoming;
       streamClient.setNoDelay(true);
       sendStreamHeader(streamClient);
-      Serial.println("[STREAM] viewer attached");
+      USBLOG("[STREAM] viewer attached");
     }
 
     if (!streamClient || !streamClient.connected()) {
@@ -776,7 +800,7 @@ static void streamTask(void *) {
     if (short_write) {
       // The viewer went away mid-frame. Drop it rather than keep grabbing
       // frames for a socket nobody is reading.
-      Serial.println("[STREAM] viewer left");
+      USBLOG("[STREAM] viewer left");
       streamClient.stop();
       continue;
     }
@@ -790,7 +814,10 @@ static void streamTask(void *) {
 // ═══════════════════════════════════════════════════ setup / loop
 
 void setup() {
-  Serial.begin(115200);
+  // Fast, because this link now carries video and not just a boot log. The TX
+  // buffer has to be sized before the port opens; see usbStreamPrepare().
+  usbStreamPrepare();
+  Serial.begin(SERIAL_BAUD);
   delay(600);
   Serial.println("\n\n=== Cadence camera ===");
 
@@ -821,58 +848,87 @@ void setup() {
   }
   Serial.println();
 
+  // Not fatal any more. This used to halt forever, which was defensible when
+  // Wi-Fi was the only way to reach the board and a silent brick was at least
+  // honest about it. It is indefensible now: the USB link works with no network
+  // at all, and this device has to run in a lecture hall on a network whose
+  // credentials are not compiled in and may not be joinable by an ESP32 at all.
+  // Halting here would strand the board before it ever reached usbTask.
   if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("FATAL: Wi-Fi did not connect. Check secrets.h — and note the");
-    Serial.println("S3 has no 5 GHz radio, so the network must be 2.4 GHz.");
-    while (true) delay(1000);
+    Serial.println("Wi-Fi   : NOT CONNECTED — continuing on USB only.");
+    Serial.println("          The stream, /set and the relay are unavailable;");
+    Serial.println("          frames and settings still work over the cable.");
+  } else {
+
+    // A DHCP lease moves. mDNS gives the phone a name that does not, so the
+    // vision page does not need re-pointing every time the router reshuffles.
+    if (MDNS.begin(CAM_HOSTNAME)) {
+      MDNS.addService("http", "tcp", 80);
+      Serial.printf("mDNS    : http://%s.local/stream\n", CAM_HOSTNAME);
+    }
+
+    server.on("/", handleRoot);
+    server.on("/jpg", handleJpg);
+    server.on("/status", handleStatus);
+    server.on("/set", handleSet);
+    server.on("/vision", handleVision);
+    server.on("/session", handleSession);
+    server.on("/focus", HTTP_POST, handleFocus);
+    server.on("/focus", HTTP_OPTIONS, handleFocus);
+    server.begin();
+
+    // Own task so a connected viewer can never block the control server.
+    xTaskCreatePinnedToCore(streamTask, "stream", 4096, nullptr, 1, nullptr, 1);
+
+    // Same reasoning for the upstream POST: TLS blocks, and the handler that
+    // queues it must not. 12 KB because the handshake alone wants about 6.
+    relayLock = xSemaphoreCreateMutex();
+    if (!relayLock) {
+      Serial.println("FATAL: could not create the relay mutex.");
+      while (true) delay(1000);
+    }
+    xTaskCreatePinnedToCore(relayTask, "relay", 12288, nullptr, 1, nullptr, 0);
+
+    String ip = WiFi.localIP().toString();
+    Serial.printf("Wi-Fi   : up, ip=%s rssi=%d\n", ip.c_str(), WiFi.RSSI());
+    Serial.printf("Stream  : http://%s:81/stream\n", ip.c_str());
+    Serial.printf("Preview : http://%s/\n", ip.c_str());
+    Serial.printf("Status  : http://%s/status\n", ip.c_str());
+    Serial.printf("Tune    : http://%s/set?size=qvga&q=15\n", ip.c_str());
+    Serial.printf("Vision  : http://%s/vision\n", ip.c_str());
   }
 
-  // A DHCP lease moves. mDNS gives the phone a name that does not, so the
-  // vision page does not need re-pointing every time the router reshuffles.
-  if (MDNS.begin(CAM_HOSTNAME)) {
-    MDNS.addService("http", "tcp", 80);
-    Serial.printf("mDNS    : http://%s.local/stream\n", CAM_HOSTNAME);
-  }
+  // Outside the Wi-Fi branch entirely. This is the whole point of the change:
+  // the cable needs no network, no DHCP lease, no mDNS and no access point,
+  // so starting it must not be conditional on any of them.
+  // Before usbStreamBegin so its banner is the last line of the boot log.
+  // Runs whether or not Wi-Fi came up: not needing an access point is the
+  // entire reason this is here rather than another HTTP endpoint.
+  cadenceNowBegin(true);
 
-  server.on("/", handleRoot);
-  server.on("/jpg", handleJpg);
-  server.on("/status", handleStatus);
-  server.on("/set", handleSet);
-  server.on("/vision", handleVision);
-  server.on("/session", handleSession);
-  server.on("/focus", HTTP_POST, handleFocus);
-  server.on("/focus", HTTP_OPTIONS, handleFocus);
-  server.begin();
-
-  // Own task so a connected viewer can never block the control server.
-  xTaskCreatePinnedToCore(streamTask, "stream", 4096, nullptr, 1, nullptr, 1);
-
-  // Same reasoning for the upstream POST: TLS blocks, and the handler that
-  // queues it must not. 12 KB because the handshake alone wants about 6.
-  relayLock = xSemaphoreCreateMutex();
-  if (!relayLock) {
-    Serial.println("FATAL: could not create the relay mutex.");
-    while (true) delay(1000);
-  }
-  xTaskCreatePinnedToCore(relayTask, "relay", 12288, nullptr, 1, nullptr, 0);
-
-  String ip = WiFi.localIP().toString();
-  Serial.printf("Wi-Fi   : up, ip=%s rssi=%d\n", ip.c_str(), WiFi.RSSI());
-  Serial.printf("Stream  : http://%s:81/stream\n", ip.c_str());
-  Serial.printf("Preview : http://%s/\n", ip.c_str());
-  Serial.printf("Status  : http://%s/status\n", ip.c_str());
-  Serial.printf("Tune    : http://%s/set?size=qvga&q=15\n", ip.c_str());
-  Serial.printf("Vision  : http://%s/vision\n", ip.c_str());
+  usbStreamBegin();
+  Serial.printf("USB     : %ld baud, send C1 to start frames\n", (long)SERIAL_BAUD);
 }
 
 void loop() {
   server.handleClient();
 
+  // Tell the hub we are alive, and whether a USB host is actually pulling
+  // frames. This replaces what the hub used to read out of the HTTP response
+  // to its own push — a reply that does not exist when there is no network.
+  // Two seconds, against the ten-second staleness window on the hub side.
+  static uint32_t lastNowStatus = 0;
+  if (millis() - lastNowStatus >= 2000UL) {
+    lastNowStatus = millis();
+    cadenceNowSend(CADENCE_NOW_STATUS, sessionNow(),
+                   usbStreaming ? CADENCE_NOW_F_STREAMING : 0);
+  }
+
   static uint32_t lastCheck = 0;
   if (millis() - lastCheck > 10000) {
     lastCheck = millis();
     if (WiFi.status() != WL_CONNECTED) {
-      Serial.println("[WIFI] link lost, reconnecting");
+      USBLOG("[WIFI] link lost, reconnecting");
       WiFi.reconnect();
     }
   }

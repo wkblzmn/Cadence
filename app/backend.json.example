@@ -1,0 +1,6 @@
+{
+  "_comment": "Copy to backend.json and fill in. Used only when the camera board cannot be reached over the network to relay for us - which is every time the board is on a USB cable and nothing else. The board's relay is still preferred whenever it answers.",
+  "api_base": "https://project-cadence-32.vercel.app",
+  "token": "same-token-as-the-hub-and-dashboard",
+  "device_id": "cadence-hub-01"
+}
