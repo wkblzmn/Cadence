@@ -58,6 +58,21 @@ static bool     nowLocked  = false;
 // demonstration settles within a couple of minutes of being switched on.
 #define CADENCE_NOW_GIVEUP 6
 
+// A second network is optional; an older secrets.h simply has no WIFI_SSID2.
+#ifndef WIFI_SSID2
+#define WIFI_SSID2 ""
+#define WIFI_PASS2 ""
+#endif
+
+// Alternate between the two networks on successive attempts, so neither can
+// starve the other. Empty second SSID collapses this to the first.
+static inline const char *cadenceSsid(uint8_t attempt) {
+  return (attempt % 2 && WIFI_SSID2[0]) ? WIFI_SSID2 : WIFI_SSID;
+}
+static inline const char *cadencePass(uint8_t attempt) {
+  return (attempt % 2 && WIFI_SSID2[0]) ? WIFI_PASS2 : WIFI_PASS;
+}
+
 // Both sketches define both of these; each implements the one it cares about
 // and leaves the other empty. Simpler than making the header conditional, and
 // it keeps the two roles visible side by side in one place.

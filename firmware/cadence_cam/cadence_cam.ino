@@ -931,9 +931,12 @@ void loop() {
     if (WiFi.status() == WL_CONNECTED) {
       wifiFails = 0;
     } else if (wifiFails < CADENCE_NOW_GIVEUP) {
+      // Alternate between the configured networks rather than retrying one.
+      // The second is meant to be a phone hotspot, which is the only kind of
+      // network an ESP32 can join away from home.
+      WiFi.begin(cadenceSsid(wifiFails), cadencePass(wifiFails));
       wifiFails++;
-      USBLOG("[WIFI] link lost, reconnecting");
-      WiFi.reconnect();
+      USBLOG("[WIFI] link lost, trying the next network");
     } else {
       // Nothing to join. Stop scanning and leave the radio where ESP-NOW can
       // use it; the cable does not need a network and neither does the hub link.

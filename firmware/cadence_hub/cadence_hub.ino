@@ -440,10 +440,11 @@ static void netBegin() {
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);            // sleep adds latency and hurts NTP jitter
   WiFi.setAutoReconnect(false);    // this state machine owns reconnection
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  const char *ssid = cadenceSsid(netRetryCount);
+  WiFi.begin(ssid, cadencePass(netRetryCount));
   netState      = NET_CONNECTING;
   netAttemptMs  = millis();
-  Serial.printf("[WIFI] connecting to \"%s\"\n", WIFI_SSID);
+  Serial.printf("[WIFI] connecting to \"%s\"\n", ssid);
 }
 
 static void netService() {
