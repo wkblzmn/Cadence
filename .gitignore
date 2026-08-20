@@ -56,3 +56,10 @@ app/backend.json
 app/spool.json
 app/spool.json.tmp
 app/serial_port.json
+
+# ── report documents ─────────────────────────────────────────────────────
+# Kept outside version control. Word rewrites the whole file on every save, so
+# each edit is a fresh ~450 KB binary blob in history that cannot be diffed or
+# merged. The lock files it leaves behind are noise too.
+*.docx
+~$*.docx
